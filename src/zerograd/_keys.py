@@ -41,6 +41,15 @@ def candidate_key(base_key: Array, candidate_id: int | Array) -> Array:
     candidate = jnp.asarray(candidate_id)
     if candidate.ndim != 0 or not jnp.issubdtype(candidate.dtype, jnp.integer):
         raise TypeError("candidate_id must be an integer scalar")
+    # Reject negative concrete scalars to match the int branch. Traced
+    # scalars (e.g. inside jax.vmap over a non-negative candidate-id array)
+    # cannot be concretized here, so the check is skipped in that case —
+    # the library only ever vmaps over jnp.arange(0, population).
+    try:
+        if int(candidate) < 0:
+            raise ValueError("candidate_id must be non-negative")
+    except jax.errors.ConcretizationTypeError:
+        pass
     return jax.random.fold_in(base_key, candidate)
 
 

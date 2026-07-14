@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeAlias
 
@@ -47,6 +47,12 @@ class Manifest:
 
     version: int
     entries: tuple[ManifestEntry, ...]
+    # Lazy-free lookup tables built once in __post_init__; excluded from
+    # equality/hash since they are deterministic functions of ``entries``.
+    # They turn the per-candidate hot-path O(n) scans in entry()/group_index()
+    # into O(1) dict lookups (see issue #25).
+    _path_index: dict = field(init=False, repr=False, compare=False, default_factory=dict)
+    _group_index: dict = field(init=False, repr=False, compare=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -67,20 +73,28 @@ class Manifest:
         groups = tuple(entry.group for entry in self.entries)
         if len(set(groups)) != len(groups):
             raise ValueError("manifest groups must be unique; reuse one entry for tied uses")
+        object.__setattr__(
+            self, "_path_index", {entry.path: entry for entry in self.entries}
+        )
+        object.__setattr__(
+            self,
+            "_group_index",
+            {entry.group: i for i, entry in enumerate(self.entries)},
+        )
 
     def entry(self, path: ParameterPath) -> ManifestEntry:
         """Return the explicitly registered entry for ``path``."""
-        for entry in self.entries:
-            if entry.path == path:
-                return entry
-        raise KeyError(f"path is not in the manifest: {'.'.join(path)}")
+        try:
+            return self._path_index[path]
+        except KeyError as error:
+            raise KeyError(f"path is not in the manifest: {'.'.join(path)}") from error
 
     def group_index(self, group: str) -> int:
         """Return the canonical split index for one manifest group."""
-        for index, entry in enumerate(self.entries):
-            if entry.group == group:
-                return index
-        raise KeyError(f"group is not in the manifest: {group}")
+        try:
+            return self._group_index[group]
+        except KeyError as error:
+            raise KeyError(f"group is not in the manifest: {group}") from error
 
     def resolve(self, params: ParameterTree, path: ParameterPath) -> jax.Array:
         """Resolve an explicitly named array leaf without relying on tree order."""

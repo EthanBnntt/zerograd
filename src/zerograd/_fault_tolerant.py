@@ -31,7 +31,7 @@ that join mid-training.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
@@ -44,8 +44,13 @@ from ._optimizer import LossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
 
+#: Default loss-history retention window. Finite so long runs do not leak
+#: memory unbounded by default (see issue #21); ``0`` opts into unlimited
+#: retention for users who rely on late-joiner catch-up beyond this window.
+DEFAULT_MAX_LOSS_HISTORY = 1024
 
-@dataclass
+
+@dataclass(slots=True)
 class NodeStatus:
     """Lifecycle state of one node in the fault-tolerant cluster."""
 
@@ -55,6 +60,10 @@ class NodeStatus:
     active: bool = True
     paused: bool = False
     last_generation: int = 0  # last generation this node has stepped to
+    # Candidate IDs assigned to this node by the most recent repartition.
+    # Declared as a field (rather than a dynamic attribute) so NodeStatus can
+    # use slots matching the codebase value-type convention (see issue #23).
+    _shard_ids: Array | None = field(default=None, init=False, repr=False)
 
 
 class FaultTolerantCluster:
@@ -71,9 +80,11 @@ class FaultTolerantCluster:
         seed: Integer seed shared by all nodes.
         initial_nodes: Number of nodes to create at init (default 1).
         max_loss_history: Maximum generations of loss history to retain.
-            Older history is discarded. Set to 0 for unlimited. Adding a
-            node once truncation has dropped generation 0 raises
-            ``RuntimeError``, since a fresh node cannot catch up.
+            Older history is discarded. Defaults to a finite cap
+            (``DEFAULT_MAX_LOSS_HISTORY``) so long runs do not leak memory;
+            set to 0 for unlimited retention. Adding a node once truncation
+            has dropped generation 0 raises ``RuntimeError``, since a fresh
+            node cannot catch up.
     """
 
     def __init__(
@@ -83,10 +94,12 @@ class FaultTolerantCluster:
         loss_fn: LossFn,
         seed: int,
         initial_nodes: int = 1,
-        max_loss_history: int = 0,
+        max_loss_history: int = DEFAULT_MAX_LOSS_HISTORY,
     ) -> None:
-        if initial_nodes < 1:
-            raise ValueError("initial_nodes must be >= 1")
+        if not isinstance(initial_nodes, int) or isinstance(initial_nodes, bool) or initial_nodes < 1:
+            raise ValueError("initial_nodes must be a positive integer")
+        if not isinstance(max_loss_history, int) or isinstance(max_loss_history, bool) or max_loss_history < 0:
+            raise ValueError("max_loss_history must be a non-negative integer")
         self._optimizer = optimizer
         self._build_params_fn = build_params_fn
         self._loss_fn = loss_fn
@@ -234,6 +247,11 @@ class FaultTolerantCluster:
     def generation(self) -> int:
         """Current generation (number of completed steps)."""
         return self._step_count
+
+    @property
+    def max_loss_history(self) -> int:
+        """Configured loss-history retention cap (0 means unlimited)."""
+        return self._max_loss_history
 
     @property
     def loss_history_size(self) -> int:

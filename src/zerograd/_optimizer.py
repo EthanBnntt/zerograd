@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,6 +87,7 @@ class ZeroGrad:
     def init(self, params: ParameterTree) -> ZeroGradState:
         """Initialize optimizer state for the given parameter mapping."""
         self._manifest.validate(params)
+        params = _materialize_tree(params)
         opt_state = self._transform.init(params)
         return ZeroGradState(generation=0, opt_state=opt_state)
 
@@ -144,6 +145,26 @@ class ZeroGrad:
         order and passes them to ``step_from_losses``.
         """
         self._manifest.validate(params)
+        params = _materialize_tree(params)
+        return self._evaluate_shard(params, generation, loss_fn, batch, candidate_ids, rng=rng)
+
+    def _evaluate_shard(
+        self,
+        params: ParameterTree,
+        generation: int,
+        loss_fn: LossFn,
+        batch: Any,
+        candidate_ids: Array,
+        *,
+        rng: Array | None = None,
+    ) -> Array:
+        """Internal fast-path candidate evaluation that skips manifest validation.
+
+        Public callers must have already validated ``params`` via
+        ``Manifest.validate``; this exists so ``step`` can evaluate and
+        complete a generation without re-validating the same tree up to three
+        times (see issue #22).
+        """
         if rng is None:
             rng = jax.random.key(0)
 
@@ -151,8 +172,9 @@ class ZeroGrad:
 
         def evaluate_candidate(candidate_id: Array) -> Array:
             ck = candidate_key(base_key, candidate_id)
+            candidate_rng = jax.random.fold_in(rng, candidate_id)
             ctx = CandidateContext(self._manifest, ck, self._rank, self._sigma)
-            result = loss_fn(params, ctx, batch, rng)
+            result = loss_fn(params, ctx, batch, candidate_rng)
             loss, _aux = result
             return loss
 
@@ -176,12 +198,30 @@ class ZeroGrad:
         if not isinstance(state, ZeroGradState):
             raise TypeError("state must be a ZeroGradState")
         self._manifest.validate(params)
+        params = _materialize_tree(params)
+        self._check_losses(losses)
+        return self._step_from_losses(state, params, losses)
+
+    def _check_losses(self, losses: Array) -> None:
+        """Validate candidate losses (dtype, finiteness, count)."""
         validate_losses(losses)
         if losses.shape[0] != self._population_size:
             raise ValueError(
                 f"losses must have {self._population_size} entries, got {losses.shape[0]}"
             )
 
+    def _step_from_losses(
+        self,
+        state: ZeroGradState,
+        params: ParameterTree,
+        losses: Array,
+    ) -> tuple[ParameterTree, ZeroGradState, StepMetrics]:
+        """Internal fast-path generation completion that skips re-validation.
+
+        Public callers must have already validated ``state``, ``params`` and
+        ``losses``; this exists so ``step`` can avoid re-validating the same
+        inputs up to three times (see issue #22).
+        """
         generation = state.generation
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
         candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
@@ -226,13 +266,34 @@ class ZeroGrad:
         if not isinstance(state, ZeroGradState):
             raise TypeError("state must be a ZeroGradState")
         self._manifest.validate(params)
+        params = _materialize_tree(params)
         if rng is None:
             rng = jax.random.key(0)
 
         generation = state.generation
         candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
-        losses = self.evaluate_shard(params, generation, loss_fn, batch, candidate_ids, rng=rng)
-        return self.step_from_losses(state, params, losses)
+        losses = self._evaluate_shard(params, generation, loss_fn, batch, candidate_ids, rng=rng)
+        self._check_losses(losses)
+        return self._step_from_losses(state, params, losses)
+
+
+def _materialize_tree(params: ParameterTree) -> dict:
+    """Return a plain-``dict`` copy of a parameter tree.
+
+    JAX treats only ``dict`` (and registered types) as pytree nodes; other
+    ``Mapping`` subclasses (e.g. ``MappingProxyType``, ``UserDict``) are treated
+    as opaque leaves, which breaks Optax's pytree-structure assumptions and
+    leaves manifest arrays un-negated. Normalizing to plain dicts at the
+    public boundary lets any ``Mapping``-typed parameter tree work end-to-end
+    (see issue #15). Arrays and non-``Mapping`` leaves are passed through.
+    """
+    out: dict = {}
+    for key, value in params.items():
+        if isinstance(value, Mapping):
+            out[key] = _materialize_tree(value)
+        else:
+            out[key] = value
+    return out
 
 
 def _build_pseudo_grad(descent: dict, params: ParameterTree) -> dict:
@@ -246,7 +307,7 @@ def _apply_negation(params: ParameterTree, path: tuple[str, ...], descent: dict,
     """Walk the parameter tree, negating manifest entries and zeroing others."""
     for key, value in params.items():
         current_path = path + (key,)
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             sub_out: dict = {}
             _apply_negation(value, current_path, descent, sub_out)
             out[key] = sub_out
