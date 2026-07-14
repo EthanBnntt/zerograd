@@ -27,6 +27,13 @@ class TestShapeCenteredLoss:
         with pytest.raises(ValueError):
             shape_centered_loss(jnp.ones((4,)), -0.1)
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_rejects_non_finite_sigma(self, bad):
+        # Regression for issue #7: shape_centered_loss must reject non-finite
+        # sigma (NaN <= 0 is False, so it previously slipped past the check).
+        with pytest.raises(ValueError):
+            shape_centered_loss(jnp.ones((4,)), bad)
+
     def test_shaped_weights_sum_to_zero(self):
         # Centered-loss weights are mean-subtracted, so they sum to zero.
         losses = jnp.array([0.5, 1.0, 2.0, 4.0])
