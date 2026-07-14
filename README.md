@@ -83,6 +83,17 @@ single GPU. For a 4× GPU node, pass all four devices — each gets a quarter
 of the population. See `examples/train_distributed_cpu_gpu.py` and
 `examples/train_distributed_dual_worker.py` for runnable demos.
 
+For asymmetric compute (slow CPU + fast GPU, or mixed GPU generations),
+pass ``weights`` to assign more candidates to faster devices:
+
+```python
+# GPU gets 4× more candidates than CPU
+dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn, weights=[1, 4])
+
+# Or auto-calibrate from measured device speed
+dist_opt.calibrate(params, batch)
+```
+
 For custom multi-process setups, use `optimizer.evaluate_shard()` and
 `optimizer.step_from_losses()` directly — the only data that crosses process
 boundaries is the 1D loss array.

@@ -24,6 +24,7 @@ uv pip install Pillow  # only for CIFAR-10 image loading
 | `train_vit_cifar10.py` | CIFAR-10 | ViT (2L, 4H, d=64) | ZeroGrad vs AdamW, bf16 vs 4-bit QAT — see [findings](vit_findings.md) |
 | `train_distributed_cpu_gpu.py` | XOR gate (synthetic) | 2→16→1 MLP | Population split across **CPU + GPU** workers |
 | `train_distributed_dual_worker.py` | XOR gate (synthetic) | 2→16→1 MLP | Two workers on the **same GPU** |
+| `train_distributed_asymmetric.py` | Synthetic (512→512→10) | MLP | **Asymmetric compute**: manual weights vs auto-calibration |
 
 ## Running
 
@@ -123,3 +124,32 @@ for step in range(steps):
 For a 4× GPU node, pass all four GPU devices — each gets a quarter of the
 population. For two workers on one GPU, pass the same GPU device twice. The
 protocol is identical in all cases.
+
+### Asymmetric compute (weighted partitioning)
+
+When devices have different speeds, an even split wastes the fast device.
+Pass ``weights`` to assign more candidates to faster devices:
+
+```python
+# 1 slow CPU + 1 fast GPU: GPU gets 4× more candidates
+dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn, weights=[1, 4])
+
+# 4 slow GPUs + 1 fast GPU
+dist_opt = DistributedZeroGrad(
+    opt, devices=[gpu0, gpu1, gpu2, gpu3, gpu4], loss_fn=loss_fn,
+    weights=[1, 1, 1, 1, 4],
+)
+```
+
+Or let auto-calibration measure each device and set weights automatically:
+
+```python
+dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn)
+results = dist_opt.calibrate(params, batch)  # times each device, sets weights
+print(dist_opt.weights)      # e.g. [1.0, 3.7]
+print(dist_opt.partition_sizes)  # e.g. [14, 50]
+```
+
+Calibration runs a few timed evaluations per device (with JIT warmup) and
+sets weights inversely proportional to per-candidate time.  Call it once
+before training starts.
