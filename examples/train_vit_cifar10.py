@@ -327,7 +327,8 @@ def main():
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Directory to save each variant's params + history.")
+                        help="Directory to save each variant's params + history "
+                             "(save-only; no --resume, unlike train_mnist/train_cifar10).")
     args = parser.parse_args()
 
     print("Loading CIFAR-10 ...")

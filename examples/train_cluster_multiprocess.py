@@ -13,6 +13,9 @@ Each worker is a completely fresh Python process with its own JAX
 context, simulating a real multi-node cluster. The only difference from
 a real network cluster is the transport (pipes instead of TCP).
 
+Note: this example uses ``select.select`` on pipe file descriptors, which
+is not supported on Windows. It is Unix-only (Linux/macOS).
+
     uv run python examples/train_cluster_multiprocess.py [--steps N] [--nodes N]
 """
 

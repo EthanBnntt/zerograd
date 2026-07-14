@@ -46,7 +46,11 @@ def save_checkpoint(path: str, step: int, params: Any, state: Any, extra: Any = 
 
 
 def load_checkpoint(path: str) -> dict:
-    """Load a checkpoint written by :func:`save_checkpoint`."""
+    """Load a checkpoint written by :func:`save_checkpoint`.
+
+    Uses ``pickle.load`` — only load checkpoints from sources you trust, since
+    unpickling arbitrary data can execute arbitrary code.
+    """
     with open(path, "rb") as f:
         return pickle.load(f)
 
