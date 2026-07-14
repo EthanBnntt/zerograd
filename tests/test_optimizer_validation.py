@@ -58,6 +58,13 @@ class TestConstructorValidation:
         with pytest.raises(ValueError):
             _make_opt(sigma=1)  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_rejects_non_finite_sigma(self, bad):
+        # Regression for issue #7: NaN/inf sigma must be rejected at construction
+        # (NaN <= 0 is False, so it previously slipped past the positive check).
+        with pytest.raises(ValueError):
+            _make_opt(sigma=bad)
+
     def test_rejects_bool_seed(self):
         with pytest.raises(TypeError):
             _make_opt(seed=True)  # type: ignore[arg-type]

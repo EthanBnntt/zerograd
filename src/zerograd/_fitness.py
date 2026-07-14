@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 
@@ -22,8 +24,8 @@ def shape_centered_loss(losses: Array, sigma: float) -> Array:
     population_size = losses.shape[0]
     if population_size < 2:
         raise ValueError("at least two candidate losses are required")
-    if sigma <= 0:
-        raise ValueError(f"sigma must be positive, got {sigma}")
+    if not isinstance(sigma, float) or not math.isfinite(sigma) or sigma <= 0:
+        raise ValueError(f"sigma must be a finite positive float, got {sigma!r}")
     centered = losses - jnp.mean(losses)
     return jnp.asarray(-(centered) / (population_size * sigma), dtype=losses.dtype)
 

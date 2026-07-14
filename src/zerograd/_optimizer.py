@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -69,8 +70,8 @@ class ZeroGrad:
             raise ValueError("population_size must be an integer >= 2")
         if not isinstance(rank, int) or isinstance(rank, bool) or rank < 1:
             raise ValueError("rank must be a positive integer")
-        if not isinstance(sigma, float) or sigma <= 0:
-            raise ValueError("sigma must be a positive float")
+        if not isinstance(sigma, float) or not math.isfinite(sigma) or sigma <= 0:
+            raise ValueError("sigma must be a finite positive float")
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise TypeError("seed must be an integer")
         if not isinstance(run_id, str) or not run_id:
