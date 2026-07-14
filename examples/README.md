@@ -45,10 +45,15 @@ uv run python examples/train_distributed_asymmetric.py
 # Cluster — seed-derived params, only fitnesses shared
 uv run python examples/train_cluster_seed_derived.py
 uv run python examples/train_cluster_multiprocess.py
+uv run python examples/train_cluster_unreliable.py
 
 # Slower (minutes) — downloads data on first run
 uv run python examples/train_mnist.py --steps 200
 uv run python examples/train_cifar10.py --steps 300
+uv run python examples/train_vit_cifar10.py --steps 200
+
+# Experiment — batch-size vs population-size tradeoff (downloads MNIST)
+uv run python examples/experiment_batch_vs_pop.py --steps 200
 ```
 
 Datasets are cached in `~/.cache/zerograd/` after first download.

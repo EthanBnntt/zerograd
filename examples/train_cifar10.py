@@ -31,6 +31,7 @@ import optax
 
 from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
 
+from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
 from _data import load_cifar10
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -90,6 +91,16 @@ def main():
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to write periodic checkpoints (params + state).")
+    parser.add_argument("--checkpoint-interval", type=int, default=20,
+                        help="Save a checkpoint every N steps.")
+    parser.add_argument("--early-stopping", action="store_true",
+                        help="Stop early when the loss plateaus.")
+    parser.add_argument("--patience", type=int, default=50,
+                        help="Early-stopping patience (steps without improvement).")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from a checkpoint file.")
     args = parser.parse_args()
 
     print("Loading CIFAR-10 ...")
@@ -113,12 +124,21 @@ def main():
         seed=args.seed,
         run_id="cifar-demo",
     )
-    state = optimizer.init(params)
+    start_step = 0
+    if args.resume:
+        ck = load_checkpoint(args.resume)
+        params = ck["params"]
+        state = ck["state"]
+        start_step = ck["step"] + 1
+        print(f"Resumed from {args.resume} at step {start_step}")
+    else:
+        state = optimizer.init(params)
 
     num_train = x_train.shape[0]
+    es = EarlyStopping(patience=args.patience, mode="min") if args.early_stopping else None
     print(f"\nTraining: {args.steps} steps, pop=32, batch={args.batch}\n")
 
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         idx = jax.random.randint(jax.random.fold_in(key, step), (args.batch,), 0, num_train)
         batch = (x_train[idx], y_train[idx])
 
@@ -136,7 +156,16 @@ def main():
                 f"({dt:.1f}s/step)"
             )
 
+        if args.checkpoint and (step + 1) % args.checkpoint_interval == 0:
+            save_checkpoint(args.checkpoint, step, params, state)
+            print(f"  checkpoint saved: {args.checkpoint}")
+        if es is not None and es(float(metrics.mean_loss)):
+            print(f"Early stopping at step {step}: loss plateaued for {args.patience} steps.")
+            break
+
     print(f"\nFinal test accuracy: {float(evaluate(params, x_test, y_test)):.1%}")
+    if args.checkpoint:
+        save_checkpoint(args.checkpoint, step, params, state)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 """Validation and behavior tests for deterministic PRNG key derivation."""
 
-import jax
 import jax.numpy as jnp
 import pytest
 

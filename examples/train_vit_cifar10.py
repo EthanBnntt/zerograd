@@ -29,6 +29,7 @@ import optax
 
 from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
 
+from _checkpoint import save_checkpoint
 from _data import load_cifar10
 
 # ── ViT config ────────────────────────────────────────────────────────────────
@@ -200,7 +201,7 @@ def vit_forward_direct(params, images, quantize, bf16):
 
     B = images.shape[0]
     # STE for backprop, plain round for ZeroGrad
-    q = (quantize_4bit_ste if quantize else (lambda x: x)) if not hasattr(images, '_zg') else quantize_4bit
+    q = quantize_4bit_ste if quantize else (lambda x: x)
 
     patches = extract_patches(images)
     if bf16:
@@ -325,6 +326,9 @@ def main():
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Directory to save each variant's params + history "
+                             "(save-only; no --resume, unlike train_mnist/train_cifar10).")
     args = parser.parse_args()
 
     print("Loading CIFAR-10 ...")
@@ -346,13 +350,13 @@ def main():
     results = {}
 
     variants = [
-        ("zerograd-bf16",   "zerograd", False, False, True),
-        ("zerograd-4bit",   "zerograd", True,  False, False),
-        ("adamw-bf16",      "adamw",    False, False, True),
-        ("adamw-4bit-ste",  "adamw",    True,  False, False),
+        ("zerograd-bf16",   "zerograd", False, True),
+        ("zerograd-4bit",   "zerograd", True,  False),
+        ("adamw-bf16",      "adamw",    False, True),
+        ("adamw-4bit-ste",  "adamw",    True,  False),
     ]
 
-    for name, method, quantize, _, bf16 in variants:
+    for name, method, quantize, bf16 in variants:
         print("=" * 70)
         ste_note = " (with STE)" if (method == "adamw" and quantize) else (" (no STE)" if (method == "zerograd" and quantize) else "")
         print(f"{name.upper()}{ste_note}")
@@ -380,6 +384,16 @@ def main():
             "avg_step": sum(h[4] for h in history) / len(history),
             "history": history,
         }
+        if args.checkpoint:
+            # Save each variant's final params + history so a long run is not
+            # lost on interruption (see issue #34).
+            import os
+            save_checkpoint(
+                os.path.join(args.checkpoint, f"{name}.ckpt"),
+                step=args.steps, params=params, state=None,
+                extra={"history": history, "method": method},
+            )
+            print(f"  checkpoint saved: {args.checkpoint}/{name}.ckpt")
         print()
 
     # ── Comparison table ──────────────────────────────────────────────────────

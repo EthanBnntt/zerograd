@@ -68,32 +68,33 @@ def loss_fn(params, candidate, batch, rng):
 
 def run_experiment(name, optimizer, devices, loss_fn, params, batch, steps, weights=None, calibrate=False):
     """Run one experiment configuration and report timing."""
-    dist_opt = DistributedZeroGrad(optimizer, devices, loss_fn, weights=weights)
-
     print(f"\n{'=' * 70}")
     print(f"  {name}")
     print(f"{'=' * 70}")
 
-    if calibrate:
-        print("  Calibrating devices...")
-        results = dist_opt.calibrate(params, batch, warmup=2, trials=3)
-        for r in results:
-            print(f"    {r.name}: {r.per_candidate_seconds*1000:.2f}ms/candidate")
-        print(f"    → weights={[f'{w:.1f}' for w in dist_opt.weights]}")
-        print(f"    → partition={dist_opt.partition_sizes}")
-    else:
-        print(f"  weights={dist_opt.weights}")
-        print(f"  partition={dist_opt.partition_sizes}")
+    # Use the coordinator as a context manager so its ThreadPoolExecutor is
+    # always shut down, even if the run is interrupted (see issue #27).
+    with DistributedZeroGrad(optimizer, devices, loss_fn, weights=weights) as dist_opt:
+        if calibrate:
+            print("  Calibrating devices...")
+            results = dist_opt.calibrate(params, batch, warmup=2, trials=3)
+            for r in results:
+                print(f"    {r.name}: {r.per_candidate_seconds*1000:.2f}ms/candidate")
+            print(f"    → weights={[f'{w:.1f}' for w in dist_opt.weights]}")
+            print(f"    → partition={dist_opt.partition_sizes}")
+        else:
+            print(f"  weights={dist_opt.weights}")
+            print(f"  partition={dist_opt.partition_sizes}")
 
-    state = dist_opt.init(params)
-    t0 = time.time()
-    for step in range(steps):
-        params, state, metrics = dist_opt.step(state, params, batch)
-        if step % 20 == 0 or step == steps - 1:
-            print(f"    gen {metrics.generation:3d}  loss={metrics.mean_loss:.4f}  "
-                  f"({(time.time() - t0) / (step + 1):.3f}s/step)")
-    total = time.time() - t0
-    print(f"    Total: {total:.1f}s ({total/steps:.3f}s/step)")
+        state = dist_opt.init(params)
+        t0 = time.time()
+        for step in range(steps):
+            params, state, metrics = dist_opt.step(state, params, batch)
+            if step % 20 == 0 or step == steps - 1:
+                print(f"    gen {metrics.generation:3d}  loss={metrics.mean_loss:.4f}  "
+                      f"({(time.time() - t0) / (step + 1):.3f}s/step)")
+        total = time.time() - t0
+        print(f"    Total: {total:.1f}s ({total/steps:.3f}s/step)")
     return total, params
 
 
@@ -108,7 +109,16 @@ def main():
     args = parser.parse_args()
 
     cpu = jax.devices("cpu")[0]
-    gpu = jax.devices("gpu")[0]
+    gpus = jax.devices("gpu")
+    if gpus:
+        gpu = gpus[0]
+    else:
+        # No GPU available: fall back to CPU with a warning, instead of
+        # crashing with an unhelpful IndexError (see issue #28).
+        print("Warning: no GPU found; falling back to CPU. The asymmetric "
+              "compute demo is most meaningful with a GPU, but the protocol "
+              "is device-agnostic.")
+        gpu = cpu
     print(f"Devices: CPU={cpu.platform}:{cpu.id}, GPU={gpu.platform}:{gpu.id}")
     print(f"Model: {INPUT_DIM}→{HIDDEN_DIM}→{OUTPUT_DIM}, pop={args.pop}, batch={args.batch}")
     print(f"Steps: {args.steps}")

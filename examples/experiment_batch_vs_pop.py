@@ -9,11 +9,12 @@ A single GPU evaluates all candidates, so compute ≈ pop * batch forward passes
 
 Configurations (pop * batch = 8192 total forward passes per step):
 
-  1. pop=32,  batch=256   (baseline)
-  2. pop=64,  batch=128   (2× population, ½ batch)
-  3. pop=128, batch=64    (4× population, ¼ batch)
-  4. pop=16,  batch=512   (½ population, 2× batch)
-  5. pop=8,   batch=1024  (¼ population, 2× batch)
+  1. pop=32,   batch=256   (baseline)
+  2. pop=64,   batch=128   (2× population, ½ batch)
+  3. pop=128,  batch=64    (4× population, ¼ batch)
+  4. pop=256,  batch=32    (8× population, ⅛ batch)
+  5. pop=16,   batch=512   (½ population, 2× batch)
+  6. pop=8,    batch=1024  (¼ population, 4× batch)
 
 Model: 784→128→10 MLP on MNIST. 200 steps. Same seed, same lr, same sigma.
 
