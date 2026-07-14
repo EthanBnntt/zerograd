@@ -21,6 +21,10 @@ uv pip install Pillow  # only for CIFAR-10 image loading
 | `train_qat_xor.py` | XOR gate (synthetic) | 2→16→1 MLP, **4-bit quantized** | Trains through `jnp.round()` — **no STE needed** |
 | `train_mnist.py` | MNIST | 784→64→10 MLP | Real image classification |
 | `train_cifar10.py` | CIFAR-10 | 3072→128→10 MLP | Harder image classification |
+| `train_vit_cifar10.py` | CIFAR-10 | ViT (2L, 4H, d=64) | ZeroGrad vs AdamW, bf16 vs 4-bit QAT — see [findings](vit_findings.md) |
+| `train_qat_xor.py` | XOR gate (synthetic) | 2→16→1 MLP, **4-bit quantized** | Trains through `jnp.round()` — **no STE needed** |
+| `train_mnist.py` | MNIST | 784→64→10 MLP | Real image classification |
+| `train_cifar10.py` | CIFAR-10 | 3072→128→10 MLP | Harder image classification |
 
 ## Running
 
