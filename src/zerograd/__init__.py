@@ -3,6 +3,7 @@
 from ._candidate import CandidateContext, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
 from ._cluster import ClusterZeroGrad, ZeroGradNode
 from ._distributed import CalibrationResult, DeviceShard, DistributedZeroGrad, ShardResult, compute_partition_sizes
+from ._fault_tolerant import FaultTolerantCluster, NodeStatus
 from ._factors import matrix_factors, scaled_factor, table_factors, vector_noise
 from ._fitness import shape_centered_loss, validate_losses
 from ._keys import candidate_key, group_key, step_key
@@ -16,8 +17,10 @@ __all__ = [
     "ClusterZeroGrad",
     "DeviceShard",
     "DistributedZeroGrad",
+    "FaultTolerantCluster",
     "Manifest",
     "ManifestEntry",
+    "NodeStatus",
     "ParameterLayout",
     "ParameterPath",
     "ParameterTree",
