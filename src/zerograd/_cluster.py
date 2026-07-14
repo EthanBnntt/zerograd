@@ -166,6 +166,10 @@ class ClusterZeroGrad:
     ) -> None:
         if num_nodes < 1:
             raise ValueError("num_nodes must be >= 1")
+        if weights is not None and len(weights) != num_nodes:
+            raise ValueError(
+                f"weights length ({len(weights)}) must match num_nodes ({num_nodes})"
+            )
         self._optimizer = optimizer
         self._seed = seed
         self._nodes: list[ZeroGradNode] = [

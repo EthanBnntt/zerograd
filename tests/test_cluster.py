@@ -98,6 +98,22 @@ class TestClusterConstruction:
         with pytest.raises(ValueError):
             ClusterZeroGrad(_make_opt(), _build_params, _loss_fn, seed=42, num_nodes=0)
 
+    def test_rejects_weights_longer_than_num_nodes(self):
+        # Regression for issue #4: mismatched weights length must fail at
+        # construction, not surface as a confusing losses-length error in step().
+        with pytest.raises(ValueError):
+            ClusterZeroGrad(
+                _make_opt(), _build_params, _loss_fn, seed=42,
+                num_nodes=2, weights=[1.0, 1.0, 1.0],
+            )
+
+    def test_rejects_weights_shorter_than_num_nodes(self):
+        with pytest.raises(ValueError):
+            ClusterZeroGrad(
+                _make_opt(), _build_params, _loss_fn, seed=42,
+                num_nodes=3, weights=[1.0],
+            )
+
     def test_default_equal_weights_partition(self):
         cluster = ClusterZeroGrad(
             _make_opt(pop=8), _build_params, _loss_fn, seed=42, num_nodes=4,
