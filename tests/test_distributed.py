@@ -230,6 +230,31 @@ class TestDistributedStep:
         assert new_state.generation == 1
 
 
+class TestShutdown:
+    """Regression tests for issue #5: ThreadPoolExecutor must be releasable."""
+
+    def test_shutdown_releases_executor_and_blocks_step(self):
+        coord = DistributedZeroGrad(_make_opt(), [_a_device()], _loss_fn)
+        coord.init(_params())
+        coord.shutdown()
+        assert coord._executor is None
+        with pytest.raises(RuntimeError):
+            coord.step(coord.init(_params()), _params(), jnp.ones((3, 4)))
+
+    def test_shutdown_is_idempotent(self):
+        coord = DistributedZeroGrad(_make_opt(), [_a_device()], _loss_fn)
+        coord.shutdown()
+        coord.shutdown()  # second call must not raise
+        assert coord._executor is None
+
+    def test_context_manager_shuts_down_on_exit(self):
+        with DistributedZeroGrad(_make_opt(), [_a_device()], _loss_fn) as coord:
+            assert coord._executor is not None
+        assert coord._executor is None
+        with pytest.raises(RuntimeError):
+            coord.step(coord.init(_params()), _params(), jnp.ones((3, 4)))
+
+
 class TestCalibrate:
     def test_calibrate_updates_weights_and_returns_results(self):
         opt = _make_opt(pop=8)

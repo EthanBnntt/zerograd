@@ -196,6 +196,30 @@ class DistributedZeroGrad:
         # Thread pool for concurrent evaluation
         self._executor = ThreadPoolExecutor(max_workers=len(devices))
 
+    def shutdown(self) -> None:
+        """Shut down the evaluation thread pool and release worker threads.
+
+        Idempotent; safe to call multiple times.  After shutdown the
+        coordinator can no longer ``step``.
+        """
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=False)
+            self._executor = None
+
+    def __enter__(self) -> DistributedZeroGrad:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.shutdown()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
     def _apply_partition(self) -> None:
         """Split candidate IDs according to current partition sizes and assign to shards."""
         all_ids = jnp.arange(self._optimizer.population_size, dtype=jnp.int32)
@@ -227,6 +251,8 @@ class DistributedZeroGrad:
         """
         if rng is None:
             rng = jax.random.key(0)
+        if self._executor is None:
+            raise RuntimeError("coordinator has been shut down")
 
         gen = state.generation
 
