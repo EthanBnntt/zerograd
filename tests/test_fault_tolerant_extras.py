@@ -55,6 +55,20 @@ class TestFaultTolerantProperties:
         assert fc.generation == 1
         assert fc.loss_history_size == 1
 
+    def test_generation_counts_steps_after_history_truncation(self):
+        # Regression for issue #3: once max_loss_history truncates the
+        # history, generation must keep counting completed steps instead
+        # of returning the retained-window size.
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_params, _loss_fn, seed=42,
+            initial_nodes=2, max_loss_history=3,
+        )
+        for _ in range(8):
+            fc.step(_batch())
+        assert fc.generation == 8
+        assert fc.loss_history_size == 3
+        assert fc.generation == fc.nodes[0].generation
+
     def test_init_returns_node_zero_state(self):
         fc = FaultTolerantCluster(_make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=2)
         state = fc.init()
