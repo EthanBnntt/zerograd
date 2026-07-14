@@ -1,6 +1,7 @@
 """JAX + Optax primitives for zero-gradient evolutionary optimization."""
 
 from ._candidate import CandidateContext, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
+from ._distributed import DeviceShard, DistributedZeroGrad, ShardResult
 from ._factors import matrix_factors, scaled_factor, table_factors, vector_noise
 from ._fitness import shape_centered_loss, validate_losses
 from ._keys import candidate_key, group_key, step_key
@@ -10,11 +11,14 @@ from ._replay import replay, replay_entry
 
 __all__ = [
     "CandidateContext",
+    "DeviceShard",
+    "DistributedZeroGrad",
     "Manifest",
     "ManifestEntry",
     "ParameterLayout",
     "ParameterPath",
     "ParameterTree",
+    "ShardResult",
     "StepMetrics",
     "ZeroGrad",
     "ZeroGradState",
