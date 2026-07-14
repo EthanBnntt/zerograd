@@ -25,6 +25,8 @@ uv pip install Pillow  # only for CIFAR-10 image loading
 | `train_distributed_cpu_gpu.py` | XOR gate (synthetic) | 2→16→1 MLP | Population split across **CPU + GPU** workers |
 | `train_distributed_dual_worker.py` | XOR gate (synthetic) | 2→16→1 MLP | Two workers on the **same GPU** |
 | `train_distributed_asymmetric.py` | Synthetic (512→512→10) | MLP | **Asymmetric compute**: manual weights vs auto-calibration |
+| `train_cluster_seed_derived.py` | XOR gate (synthetic) | 2→16→1 MLP | **Seed-derived cluster**: params never communicated, only losses |
+| `train_cluster_multiprocess.py` | XOR gate (synthetic) | 2→16→1 MLP | **True multi-process**: 4 isolated processes, params verified identical |
 
 ## Running
 
@@ -37,6 +39,11 @@ uv run python examples/train_qat_xor.py
 # Distributed — split population across devices
 uv run python examples/train_distributed_cpu_gpu.py
 uv run python examples/train_distributed_dual_worker.py
+uv run python examples/train_distributed_asymmetric.py
+
+# Cluster — seed-derived params, only fitnesses shared
+uv run python examples/train_cluster_seed_derived.py
+uv run python examples/train_cluster_multiprocess.py
 
 # Slower (minutes) — downloads data on first run
 uv run python examples/train_mnist.py --steps 200
@@ -153,3 +160,47 @@ print(dist_opt.partition_sizes)  # e.g. [14, 50]
 Calibration runs a few timed evaluations per device (with JIT warmup) and
 sets weights inversely proportional to per-candidate time.  Call it once
 before training starts.
+
+### Seed-derived cluster (params never communicated)
+
+For multi-node clusters, ZeroGrad has an even stronger property: **parameters
+are never sent over the network**. Each node computes its own params locally
+from a shared seed and the sequence of fitness arrays.
+
+```
+  Node 0                Node 1                Node 2
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ seed → params│  │ seed → params│  │ seed → params│  (computed locally)
+│ evaluate     │  │ evaluate     │  │ evaluate     │
+│ ↓ losses     │  │ ↓ losses     │  │ ↓ losses     │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └────────┬────────┴────────┬────────┘
+                ↓                 ↓
+         gather losses (O(pop) bytes)
+                ↓
+         broadcast to all nodes
+                ↓
+   each node: step_from_losses → identical params
+```
+
+The per-step communication is O(population) bytes — a few hundred floats —
+**regardless of model size**. A 1B-parameter model and a 1M-parameter model
+have the same network cost.
+
+```python
+from zerograd import ClusterZeroGrad
+
+cluster = ClusterZeroGrad(
+    optimizer, build_params_fn, loss_fn,
+    seed=42, num_nodes=4,
+)
+for step in range(steps):
+    params, state, metrics = cluster.step(batch)
+    assert cluster.verify_sync()  # all nodes have identical params
+```
+
+`train_cluster_seed_derived.py` runs this in-process with `verify_sync()`
+after every step. `train_cluster_multiprocess.py` spawns 4 separate Python
+processes communicating via pipes — proving true process isolation with
+zero param communication.

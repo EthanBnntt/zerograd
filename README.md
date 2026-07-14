@@ -98,6 +98,25 @@ For custom multi-process setups, use `optimizer.evaluate_shard()` and
 `optimizer.step_from_losses()` directly — the only data that crosses process
 boundaries is the 1D loss array.
 
+### Seed-derived cluster (params never communicated)
+
+For multi-node clusters, parameters are never sent over the network. Each
+node computes its own params from a shared seed and the sequence of fitness
+arrays — only the 1D loss array (O(population) bytes, model-size independent)
+is communicated.
+
+```python
+from zerograd import ClusterZeroGrad
+
+cluster = ClusterZeroGrad(optimizer, build_params_fn, loss_fn, seed=42, num_nodes=4)
+for step in range(steps):
+    params, state, metrics = cluster.step(batch)
+    assert cluster.verify_sync()  # all nodes have identical params
+```
+
+See `examples/train_cluster_seed_derived.py` (in-process) and
+`examples/train_cluster_multiprocess.py` (true multi-process) for demos.
+
 ## Development
 
 ```bash
