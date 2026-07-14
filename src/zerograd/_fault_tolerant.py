@@ -71,9 +71,9 @@ class FaultTolerantCluster:
         seed: Integer seed shared by all nodes.
         initial_nodes: Number of nodes to create at init (default 1).
         max_loss_history: Maximum generations of loss history to retain.
-            Older history is discarded. Set to 0 for unlimited. Late
-            joiners that need generations beyond the retained history
-            will not be able to catch up fully.
+            Older history is discarded. Set to 0 for unlimited. Adding a
+            node once truncation has dropped generation 0 raises
+            ``RuntimeError``, since a fresh node cannot catch up.
     """
 
     def __init__(
@@ -111,9 +111,11 @@ class FaultTolerantCluster:
         """Add a new node to the cluster. Returns its index.
 
         The node computes its params from the seed, then replays the
-        loss history to catch up to the current generation. If the loss
-        history doesn't go back far enough, the node catches up as far
-        as possible.
+        loss history to catch up to the current generation. Catch-up is
+        only possible when the retained history reaches back to
+        generation 0; if ``max_loss_history`` has truncated early
+        generations, this raises ``RuntimeError`` rather than silently
+        producing a divergent node.
 
         After adding, the partition is redistributed across active nodes.
         """
@@ -126,12 +128,21 @@ class FaultTolerantCluster:
             last_generation=0,
         )
 
-        # Catch up: replay loss history
+        # Catch up: replay loss history from generation 0 forward. The
+        # node starts at generation 0, and step_from_losses derives its
+        # replay keys from the node's internal generation, so the history
+        # must reach back to generation 0 for the keys to line up.
         if self._loss_history:
-            available_start = 0 if self._max_loss_history == 0 else max(0, len(self._loss_history) - self._max_loss_history)
-            for gen_idx in range(available_start, len(self._loss_history)):
-                node.step(self._loss_history[gen_idx])
-            status.last_generation = len(self._loss_history)
+            if self._step_count != len(self._loss_history):
+                raise RuntimeError(
+                    "cannot add a node: loss history has been truncated "
+                    f"(retained {len(self._loss_history)} of "
+                    f"{self._step_count} generations) and no longer reaches "
+                    "back to generation 0; a new node cannot catch up"
+                )
+            for losses in self._loss_history:
+                node.step(losses)
+            status.last_generation = node.generation
 
         idx = len(self._statuses)
         self._statuses.append(status)
