@@ -117,6 +117,32 @@ for step in range(steps):
 See `examples/train_cluster_seed_derived.py` (in-process) and
 `examples/train_cluster_multiprocess.py` (true multi-process) for demos.
 
+### Fault-tolerant cluster (node death, late join, pause/resume)
+
+For decentralized compute where nodes go offline unpredictably:
+
+```python
+from zerograd import FaultTolerantCluster
+
+cluster = FaultTolerantCluster(optimizer, build_params_fn, loss_fn, seed=42, initial_nodes=4)
+
+# Late join: new node replays loss history to catch up
+cluster.add_node(weight=2.0)
+
+# Pause/resume: work redistributed, node catches up on resume
+cluster.pause_node(0)
+cluster.resume_node(0)
+
+# Death: work redistributed to survivors
+cluster.remove_node(2)
+
+assert cluster.verify_sync()  # all nodes have identical params
+```
+
+The coordinator stores a loss history log so any node can catch up by
+replaying missed generations — no param communication needed. See
+`examples/train_cluster_unreliable.py` for a simulated churn scenario.
+
 ## Development
 
 ```bash

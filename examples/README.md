@@ -27,6 +27,7 @@ uv pip install Pillow  # only for CIFAR-10 image loading
 | `train_distributed_asymmetric.py` | Synthetic (512→512→10) | MLP | **Asymmetric compute**: manual weights vs auto-calibration |
 | `train_cluster_seed_derived.py` | XOR gate (synthetic) | 2→16→1 MLP | **Seed-derived cluster**: params never communicated, only losses |
 | `train_cluster_multiprocess.py` | XOR gate (synthetic) | 2→16→1 MLP | **True multi-process**: 4 isolated processes, params verified identical |
+| `train_cluster_unreliable.py` | XOR gate (synthetic) | 2→16→1 MLP | **Unreliable cluster**: simulated node death, late join, pause/resume |
 
 ## Running
 
@@ -204,3 +205,41 @@ for step in range(steps):
 after every step. `train_cluster_multiprocess.py` spawns 4 separate Python
 processes communicating via pipes — proving true process isolation with
 zero param communication.
+
+### Fault-tolerant cluster (node death, late join, pause/resume)
+
+For decentralized compute like agi@home (gaming PCs that go offline, spot
+instances that get preempted), the `FaultTolerantCluster` handles node
+lifecycle events:
+
+```python
+from zerograd import FaultTolerantCluster
+
+cluster = FaultTolerantCluster(
+    optimizer, build_params_fn, loss_fn,
+    seed=42, initial_nodes=4,
+)
+
+# Late join: new node replays loss history to catch up
+idx = cluster.add_node(weight=2.0)
+
+# Pause: node stops evaluating, work redistributed to survivors
+cluster.pause_node(0)
+
+# Resume: node replays missed generations
+cluster.resume_node(0)
+
+# Death: node removed, work redistributed
+cluster.remove_node(2)
+
+# Verify all nodes have identical params
+assert cluster.verify_sync()
+```
+
+The coordinator stores a loss history log. When a node joins or resumes,
+it replays the loss history via `step_from_losses` to catch up — arriving
+at the same params as all other nodes without any param communication.
+
+`train_cluster_unreliable.py` simulates a chaotic decentralized cluster
+with random node deaths, late joins, pauses, and weight changes — all
+while maintaining sync and matching the single-node baseline.
