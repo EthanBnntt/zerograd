@@ -59,6 +59,34 @@ params, state, metrics = optimizer.step(state, params, jnp.array([0, 1, 2]), mod
 print(f"gen {metrics.generation}: mean_loss={metrics.mean_loss:.4f}")
 ```
 
+## Distributed multi-device evaluation
+
+The ES population is embarrassingly parallel — each candidate's loss is
+computed independently, and workers only share 1D fitness arrays.
+
+```python
+from zerograd import DistributedZeroGrad
+
+cpu = jax.devices('cpu')[0]
+gpu = jax.devices('gpu')[0]
+
+opt = ZeroGrad(manifest, optax.adamw(1e-2), population_size=64, ...)
+dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=model_loss)
+
+state = dist_opt.init(params)
+for step in range(steps):
+    params, state, metrics = dist_opt.step(state, params, batch)
+```
+
+Workers can be mixed across CPU and GPU, or multiple shards can share a
+single GPU. For a 4× GPU node, pass all four devices — each gets a quarter
+of the population. See `examples/train_distributed_cpu_gpu.py` and
+`examples/train_distributed_dual_worker.py` for runnable demos.
+
+For custom multi-process setups, use `optimizer.evaluate_shard()` and
+`optimizer.step_from_losses()` directly — the only data that crosses process
+boundaries is the 1D loss array.
+
 ## Development
 
 ```bash
