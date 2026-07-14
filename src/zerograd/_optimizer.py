@@ -89,31 +89,64 @@ class ZeroGrad:
         opt_state = self._transform.init(params)
         return ZeroGradState(generation=0, opt_state=opt_state)
 
-    def step(
+    # ── Read-only configuration access (for distributed workers) ──────────────
+
+    @property
+    def population_size(self) -> int:
+        """Number of candidates per generation."""
+        return self._population_size
+
+    @property
+    def rank(self) -> int:
+        """Low-rank factor dimension."""
+        return self._rank
+
+    @property
+    def sigma(self) -> float:
+        """Perturbation scale."""
+        return self._sigma
+
+    @property
+    def manifest(self) -> Manifest:
+        """Parameter manifest."""
+        return self._manifest
+
+    @property
+    def seed(self) -> int:
+        """Base seed for replay identity."""
+        return self._seed
+
+    @property
+    def run_id(self) -> str:
+        """Stable run identifier."""
+        return self._run_id
+
+    def evaluate_shard(
         self,
-        state: ZeroGradState,
         params: ParameterTree,
-        batch: Any,
+        generation: int,
         loss_fn: LossFn,
+        batch: Any,
+        candidate_ids: Array,
         *,
         rng: Array | None = None,
-    ) -> tuple[ParameterTree, ZeroGradState, StepMetrics]:
-        """Execute one transactional optimization generation.
+    ) -> Array:
+        """Evaluate a subset of candidates and return their losses.
 
-        Generates deterministic candidates, evaluates their losses via ``loss_fn``,
-        shapes them into centered-loss weights, replays factor-only pseudo-gradients,
-        negates the descent direction into a conventional positive-loss gradient,
-        applies the Optax transform, and returns new parameters, state, and metrics.
+        Each candidate in ``candidate_ids`` is evaluated independently using
+        deterministic keys derived from the same ``generation``.  This method
+        is device-agnostic — callers control placement via ``jax.default_device``
+        or ``jax.device_put``.
+
+        Workers in a distributed setup call this with their assigned shard of
+        candidate IDs.  The coordinator then concatenates losses in candidate
+        order and passes them to ``step_from_losses``.
         """
-        if not isinstance(state, ZeroGradState):
-            raise TypeError("state must be a ZeroGradState")
         self._manifest.validate(params)
         if rng is None:
             rng = jax.random.key(0)
 
-        generation = state.generation
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
-        candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
 
         def evaluate_candidate(candidate_id: Array) -> Array:
             ck = candidate_key(base_key, candidate_id)
@@ -122,10 +155,37 @@ class ZeroGrad:
             loss, _aux = result
             return loss
 
-        losses = jax.vmap(evaluate_candidate)(candidate_ids)
-        validate_losses(losses)
-        shaped = shape_centered_loss(losses, self._sigma)
+        return jax.vmap(evaluate_candidate)(candidate_ids)
 
+    def step_from_losses(
+        self,
+        state: ZeroGradState,
+        params: ParameterTree,
+        losses: Array,
+    ) -> tuple[ParameterTree, ZeroGradState, StepMetrics]:
+        """Complete one generation using pre-computed candidate losses.
+
+        Shapes losses, replays factor-only pseudo-gradients, negates into a
+        conventional gradient, applies the Optax transform, and returns new
+        parameters, state, and metrics.
+
+        ``losses`` must contain one entry per candidate (0..population_size-1)
+        in candidate-ID order, regardless of which device evaluated which shard.
+        """
+        if not isinstance(state, ZeroGradState):
+            raise TypeError("state must be a ZeroGradState")
+        self._manifest.validate(params)
+        validate_losses(losses)
+        if losses.shape[0] != self._population_size:
+            raise ValueError(
+                f"losses must have {self._population_size} entries, got {losses.shape[0]}"
+            )
+
+        generation = state.generation
+        base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
+        candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
+
+        shaped = shape_centered_loss(losses, self._sigma)
         descent = replay(params, self._manifest, base_key, candidate_ids, shaped, self._rank)
         pseudo_grad = _build_pseudo_grad(descent, params)
 
@@ -141,6 +201,37 @@ class ZeroGrad:
             population_size=self._population_size,
         )
         return new_params, new_state, metrics
+
+    def step(
+        self,
+        state: ZeroGradState,
+        params: ParameterTree,
+        batch: Any,
+        loss_fn: LossFn,
+        *,
+        rng: Array | None = None,
+    ) -> tuple[ParameterTree, ZeroGradState, StepMetrics]:
+        """Execute one transactional optimization generation.
+
+        Generates deterministic candidates, evaluates their losses via ``loss_fn``,
+        shapes them into centered-loss weights, replays factor-only pseudo-gradients,
+        negates the descent direction into a conventional positive-loss gradient,
+        applies the Optax transform, and returns new parameters, state, and metrics.
+
+        This is a convenience method that calls ``evaluate_shard`` with all
+        candidate IDs and then ``step_from_losses``.  For multi-worker
+        distributed evaluation, call those two methods directly.
+        """
+        if not isinstance(state, ZeroGradState):
+            raise TypeError("state must be a ZeroGradState")
+        self._manifest.validate(params)
+        if rng is None:
+            rng = jax.random.key(0)
+
+        generation = state.generation
+        candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
+        losses = self.evaluate_shard(params, generation, loss_fn, batch, candidate_ids, rng=rng)
+        return self.step_from_losses(state, params, losses)
 
 
 def _build_pseudo_grad(descent: dict, params: ParameterTree) -> dict:
