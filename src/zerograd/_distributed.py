@@ -59,6 +59,8 @@ def compute_partition_sizes(population: int, weights: list[float]) -> list[int]:
     exactly, even when the division isn't clean.  Devices with zero weight
     receive zero candidates.
     """
+    if not isinstance(population, int) or isinstance(population, bool) or population < 1:
+        raise ValueError(f"population must be a positive integer, got {population!r}")
     if not weights:
         raise ValueError("weights must be non-empty")
     if any(w < 0 for w in weights):

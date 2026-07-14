@@ -26,6 +26,10 @@ def shape_centered_loss(losses: Array, sigma: float) -> Array:
         raise ValueError("at least two candidate losses are required")
     if not isinstance(sigma, float) or not math.isfinite(sigma) or sigma <= 0:
         raise ValueError(f"sigma must be a finite positive float, got {sigma!r}")
+    if not jnp.issubdtype(losses.dtype, jnp.floating):
+        raise TypeError(
+            f"losses must be a floating-point array, got dtype {losses.dtype}"
+        )
     centered = losses - jnp.mean(losses)
     return jnp.asarray(-(centered) / (population_size * sigma), dtype=losses.dtype)
 
@@ -36,5 +40,9 @@ def validate_losses(losses: Array) -> None:
         raise ValueError(f"losses must be one-dimensional, got shape {losses.shape}")
     if losses.shape[0] < 2:
         raise ValueError("at least two candidate losses are required")
+    if not jnp.issubdtype(losses.dtype, jnp.floating):
+        raise TypeError(
+            f"losses must be a floating-point array, got dtype {losses.dtype}"
+        )
     if not jnp.all(jnp.isfinite(losses)):
         raise ValueError("candidate losses must be finite")

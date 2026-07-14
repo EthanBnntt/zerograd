@@ -164,8 +164,8 @@ class ClusterZeroGrad:
         num_nodes: int = 1,
         weights: list[float] | None = None,
     ) -> None:
-        if num_nodes < 1:
-            raise ValueError("num_nodes must be >= 1")
+        if not isinstance(num_nodes, int) or isinstance(num_nodes, bool) or num_nodes < 1:
+            raise ValueError("num_nodes must be a positive integer")
         if weights is not None and len(weights) != num_nodes:
             raise ValueError(
                 f"weights length ({len(weights)}) must match num_nodes ({num_nodes})"

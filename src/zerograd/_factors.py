@@ -45,9 +45,13 @@ def matrix_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dt
     in_features, out_features = _validate_shape(shape, 2, "matrix shape")
     _validate_rank(rank)
     key_a, key_b = jax.random.split(key)
+    # Draw in float32 so factor values are stable across forward/replay
+    # regardless of the weight dtype a loss_fn may cast to (see issue #17:
+    # jax.random.normal produces different values per dtype). Cast to the
+    # requested dtype only after the draw, at the use site.
     return (
-        jax.random.normal(key_a, (in_features, rank), dtype=dtype),
-        jax.random.normal(key_b, (rank, out_features), dtype=dtype),
+        jax.random.normal(key_a, (in_features, rank), dtype=jnp.float32).astype(dtype),
+        jax.random.normal(key_b, (rank, out_features), dtype=jnp.float32).astype(dtype),
     )
 
 
@@ -56,13 +60,15 @@ def table_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dty
     rows, columns = _validate_shape(shape, 2, "table shape")
     _validate_rank(rank)
     key_a, key_b = jax.random.split(key)
+    # See matrix_factors: draw in float32 for dtype-stable parity, then cast.
     return (
-        jax.random.normal(key_a, (rows, rank), dtype=dtype),
-        jax.random.normal(key_b, (columns, rank), dtype=dtype),
+        jax.random.normal(key_a, (rows, rank), dtype=jnp.float32).astype(dtype),
+        jax.random.normal(key_b, (columns, rank), dtype=jnp.float32).astype(dtype),
     )
 
 
 def vector_noise(key: Array, shape: Sequence[int], *, dtype: jnp.dtype) -> Array:
     """Draw IID standard-normal perturbation for a one-dimensional leaf."""
     (size,) = _validate_shape(shape, 1, "vector shape")
-    return jax.random.normal(key, (size,), dtype=dtype)
+    # See matrix_factors: draw in float32 for dtype-stable parity, then cast.
+    return jax.random.normal(key, (size,), dtype=jnp.float32).astype(dtype)
