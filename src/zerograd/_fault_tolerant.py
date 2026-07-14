@@ -13,8 +13,8 @@ Node states
 -----------
 - **active**: participates in evaluation and stepping
 - **paused**: temporarily not evaluating; its candidate IDs are
-  redistributed to active nodes. Can resume by replaying missed
-  generations.
+  redistributed to active nodes. It keeps stepping (so it stays in
+  sync) and resumes evaluating on demand.
 - **dead**: permanently removed. Its candidate IDs are redistributed.
 
 When nodes join/leave, the coordinator recomputes the partition across
@@ -31,8 +31,8 @@ that join mid-training.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -124,7 +124,6 @@ class FaultTolerantCluster:
 
         # Catch up: replay loss history
         if self._loss_history:
-            start_gen = 0  # node starts at generation 0
             available_start = 0 if self._max_loss_history == 0 else max(0, len(self._loss_history) - self._max_loss_history)
             for gen_idx in range(available_start, len(self._loss_history)):
                 node.step(self._loss_history[gen_idx])
@@ -150,24 +149,25 @@ class FaultTolerantCluster:
     def pause_node(self, index: int) -> None:
         """Temporarily pause a node. Its work is redistributed.
 
-        The node stops evaluating but keeps its params. On resume, it
-        replays any missed generations.
+        The node stops evaluating but keeps its params in sync by
+        continuing to step with the gathered losses each generation.
         """
         self._statuses[index].paused = True
         self._statuses[index].active = False
         self._repartition()
 
     def resume_node(self, index: int) -> None:
-        """Resume a paused node. It replays missed generations."""
+        """Resume a paused node.
+
+        Paused nodes continue stepping during training (they receive the
+        gathered losses each generation), so the node is already caught up
+        to the current generation — no replay is needed. The node resumes
+        evaluating and its candidate IDs are re-integrated into the active
+        partition.
+        """
         status = self._statuses[index]
         status.paused = False
         status.active = True
-
-        # Replay missed generations
-        current_gen = len(self._loss_history)
-        for gen_idx in range(status.last_generation, current_gen):
-            status.node.step(self._loss_history[gen_idx])
-        status.last_generation = current_gen
 
         self._repartition()
 

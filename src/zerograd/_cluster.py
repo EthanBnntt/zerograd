@@ -42,7 +42,6 @@ network cost. Compare to backprop's O(parameters) gradient sync.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import jax
