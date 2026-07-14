@@ -3,7 +3,6 @@
 import jax
 import jax.numpy as jnp
 import optax
-import pytest
 
 from zerograd import (
     FaultTolerantCluster,
@@ -105,7 +104,6 @@ class TestFaultTolerantCluster:
             fc.step(batch)
 
         assert fc.verify_sync()
-        baseline = run_single_baseline(10, run_id="ft-test")
         # Rebuild baseline with pop=32
         opt2 = make_optimizer(pop=32)
         params = build_params(jax.random.key(42))
@@ -132,13 +130,12 @@ class TestFaultTolerantCluster:
         assert fc.verify_sync(), "late joiner should be synced after replay"
 
         # Late joiner's params should match
-        baseline = run_single_baseline(10)
         # Rebuild with pop=32
         opt2 = make_optimizer(pop=32)
         params = build_params(jax.random.key(42))
         state = opt2.init(params)
         for _ in range(10):
-            params, state, _ = opt2.step(state, params, loss_fn, batch) if False else opt2.step(state, params, batch, loss_fn)
+            params, state, _ = opt2.step(state, params, batch, loss_fn)
         late_params = fc.nodes[idx].params
         for a, b in zip(
             jax.tree_util.tree_leaves(params),
@@ -310,7 +307,7 @@ class TestFaultTolerantCluster:
         assert fc.num_total_nodes == 0
 
         # Add a fresh node — it should catch up from loss history
-        idx = fc.add_node()
+        fc.add_node()
         assert fc.num_active_nodes == 1
         assert fc.verify_sync()  # trivially true with 1 node
 

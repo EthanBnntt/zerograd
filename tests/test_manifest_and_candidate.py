@@ -10,11 +10,8 @@ from zerograd import (
     Manifest,
     ManifestEntry,
     ParameterLayout,
-    candidate_key,
     group_key,
-    matrix_factors,
     shape_centered_loss,
-    step_key,
     validate_losses,
 )
 

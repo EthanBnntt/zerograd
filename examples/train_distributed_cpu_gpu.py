@@ -22,64 +22,12 @@ import argparse
 import time
 
 import jax
-import jax.numpy as jnp
 import optax
 
-from zerograd import (
-    DistributedZeroGrad,
-    Manifest,
-    ManifestEntry,
-    ParameterLayout,
-    ZeroGrad,
-)
-
-# ── XOR model: 2→16→1 MLP ────────────────────────────────────────────────────
-INPUT_DIM = 2
-HIDDEN_DIM = 16
-OUTPUT_DIM = 1
+from zerograd import DistributedZeroGrad, ZeroGrad
+from _xor_model import XOR_X, XOR_Y, accuracy, build_manifest, build_params, loss_fn
 
 
-def build_params(key):
-    k1, k2 = jax.random.split(key)
-    return {
-        "w1": jax.random.normal(k1, (INPUT_DIM, HIDDEN_DIM)) * 0.5,
-        "b1": jnp.zeros((HIDDEN_DIM,)),
-        "w2": jax.random.normal(k2, (HIDDEN_DIM, OUTPUT_DIM)) * 0.5,
-        "b2": jnp.zeros((OUTPUT_DIM,)),
-    }
-
-
-def build_manifest():
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w1",), ParameterLayout.MATRIX, "w1"),
-        ManifestEntry(("b1",), ParameterLayout.VECTOR, "b1"),
-        ManifestEntry(("w2",), ParameterLayout.MATRIX, "w2"),
-        ManifestEntry(("b2",), ParameterLayout.VECTOR, "b2"),
-    ))
-
-
-# ── XOR data ──────────────────────────────────────────────────────────────────
-XOR_X = jnp.array([[0., 0.], [0., 1.], [1., 0.], [1., 1.]])
-XOR_Y = jnp.array([[0.], [1.], [1.], [0.]])
-
-
-def loss_fn(params, candidate, batch, rng):
-    x, y = batch
-    h = jax.nn.tanh(candidate.linear(params, ("w1",), x))
-    h = h + candidate.vector(params, ("b1",))
-    logits = candidate.linear(params, ("w2",), h)
-    logits = logits + candidate.vector(params, ("b2",))
-    return jnp.mean((logits - y) ** 2), None
-
-
-def accuracy(params):
-    h = jax.nn.tanh(XOR_X @ params["w1"]) + params["b1"]
-    logits = h @ params["w2"] + params["b2"]
-    preds = (logits > 0.5).astype(jnp.float32)
-    return float(jnp.mean(preds == XOR_Y))
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Distributed ZeroGrad: CPU + GPU on XOR")
     parser.add_argument("--steps", type=int, default=200)
@@ -90,7 +38,14 @@ def main():
     args = parser.parse_args()
 
     cpu = jax.devices("cpu")[0]
-    gpu = jax.devices("gpu")[0]
+    gpus = jax.devices("gpu")
+    if gpus:
+        gpu = gpus[0]
+    else:
+        # No GPU available: fall back to CPU for both workers with a warning,
+        # instead of crashing with an unhelpful IndexError (see issue #28).
+        print("Warning: no GPU found; falling back to CPU for both workers.")
+        gpu = cpu
     print(f"Worker 0: {cpu.platform} (id={cpu.id})")
     print(f"Worker 1: {gpu.platform} (id={gpu.id})")
     print(f"Population: {args.pop} ({args.pop // 2} per worker)")
@@ -98,6 +53,7 @@ def main():
 
     params = build_params(jax.random.key(0))
     manifest = build_manifest()
+    batch = (XOR_X, XOR_Y)
 
     base_opt = ZeroGrad(
         manifest,
@@ -109,31 +65,29 @@ def main():
         run_id="xor-cpu-gpu",
     )
 
-    dist_opt = DistributedZeroGrad(
-        base_opt,
-        devices=[cpu, gpu],
-        loss_fn=loss_fn,
-    )
+    # Use the coordinator as a context manager so its ThreadPoolExecutor is
+    # always shut down, even if the run is interrupted (see issue #27).
+    with DistributedZeroGrad(
+        base_opt, devices=[cpu, gpu], loss_fn=loss_fn,
+    ) as dist_opt:
+        state = dist_opt.init(params)
 
-    state = dist_opt.init(params)
-    batch = (XOR_X, XOR_Y)
+        for shard in dist_opt.shards:
+            print(f"  {shard.name}: {shard.device}")
 
-    for shard in dist_opt.shards:
-        print(f"  {shard.name}: {shard.device}")
+        print()
+        t0 = time.time()
+        for step in range(args.steps):
+            params, state, metrics = dist_opt.step(state, params, batch)
+            if step % 50 == 0 or step == args.steps - 1:
+                acc = accuracy(params)
+                print(f"  gen {metrics.generation:3d}  "
+                      f"loss={metrics.mean_loss:.4f}  "
+                      f"acc={acc:.0%}  "
+                      f"({(time.time() - t0) / (step + 1):.2f}s/step)")
 
-    print()
-    t0 = time.time()
-    for step in range(args.steps):
-        params, state, metrics = dist_opt.step(state, params, batch)
-        if step % 50 == 0 or step == args.steps - 1:
-            acc = accuracy(params)
-            print(f"  gen {metrics.generation:3d}  "
-                  f"loss={metrics.mean_loss:.4f}  "
-                  f"acc={acc:.0%}  "
-                  f"({(time.time() - t0) / (step + 1):.2f}s/step)")
-
-    print(f"\nFinal accuracy: {accuracy(params):.0%}")
-    print(f"Total time: {time.time() - t0:.1f}s")
+        print(f"\nFinal accuracy: {accuracy(params):.0%}")
+        print(f"Total time: {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":

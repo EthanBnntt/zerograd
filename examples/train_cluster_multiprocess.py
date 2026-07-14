@@ -21,9 +21,11 @@ from __future__ import annotations
 import argparse
 import os
 import pickle
+import select
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import jax
@@ -31,40 +33,15 @@ import jax.numpy as jnp
 import optax
 import numpy as np
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
-
-# ── Model: 2→16→1 MLP on XOR ─────────────────────────────────────────────────
-INPUT_DIM = 2
-HIDDEN_DIM = 16
-OUTPUT_DIM = 1
-
-
-def build_params(key):
-    k1, k2 = jax.random.split(key)
-    return {
-        "w1": jax.random.normal(k1, (INPUT_DIM, HIDDEN_DIM)) * 0.5,
-        "b1": jnp.zeros((HIDDEN_DIM,)),
-        "w2": jax.random.normal(k2, (HIDDEN_DIM, OUTPUT_DIM)) * 0.5,
-        "b2": jnp.zeros((OUTPUT_DIM,)),
-    }
-
-
-def build_manifest():
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w1",), ParameterLayout.MATRIX, "w1"),
-        ManifestEntry(("b1",), ParameterLayout.VECTOR, "b1"),
-        ManifestEntry(("w2",), ParameterLayout.MATRIX, "w2"),
-        ManifestEntry(("b2",), ParameterLayout.VECTOR, "b2"),
-    ))
-
-
-def loss_fn(params, candidate, batch, rng):
-    x, y = batch
-    h = jax.nn.tanh(candidate.linear(params, ("w1",), x))
-    h = h + candidate.vector(params, ("b1",))
-    logits = candidate.linear(params, ("w2",), h)
-    logits = logits + candidate.vector(params, ("b2",))
-    return jnp.mean((logits - y) ** 2), None
+from zerograd import ZeroGrad, compute_partition_sizes
+from _xor_model import (
+    HIDDEN_DIM,
+    INPUT_DIM,
+    OUTPUT_DIM,
+    build_manifest,
+    build_params,
+    loss_fn,
+)
 
 
 # ── IPC helpers ───────────────────────────────────────────────────────────────
@@ -96,6 +73,53 @@ def _recv_exact(file, n):
             return None
         buf += chunk
     return buf
+
+
+def _drain_stderr(proc, sink):
+    """Background thread: drain a worker's stderr into ``sink`` (list[str]).
+
+    Keeps the worker's stderr pipe from filling (which would block a crashed
+    worker) and captures the failure message so a dead worker can be reported
+    clearly instead of hanging the coordinator (see issue #19).
+    """
+    try:
+        for line in iter(proc.stderr.readline, b""):
+            sink.append(line.decode(errors="replace"))
+    except Exception:
+        pass
+
+
+def _dead_worker_msg(proc, stderr_sink):
+    tail = "".join(stderr_sink[-20:]).strip()
+    msg = (f"worker process {proc.pid} exited (code {proc.returncode}) "
+           f"without responding")
+    if tail:
+        msg += f"; stderr tail:\n{tail}"
+    return msg
+
+
+def _recv_checked(proc, stderr_sink, timeout=60.0):
+    """Receive from a worker, raising a clear error if it has died.
+
+    Checks ``proc.poll()`` and waits on the stdout pipe with a timeout so a
+    crashed worker surfaces as an error (with its captured stderr) instead of
+    blocking the coordinator forever (see issue #19).
+    """
+    if proc.poll() is not None:
+        raise RuntimeError(_dead_worker_msg(proc, stderr_sink))
+    fd = proc.stdout.fileno()
+    ready, _, _ = select.select([fd], [], [], timeout)
+    if not ready:
+        if proc.poll() is not None:
+            raise RuntimeError(_dead_worker_msg(proc, stderr_sink))
+        raise TimeoutError(
+            f"worker process {proc.pid} did not respond within {timeout}s"
+        )
+    result = _recv(proc.stdout)
+    if result is None:
+        # stdout hit EOF before a full message arrived — the worker has died.
+        raise RuntimeError(_dead_worker_msg(proc, stderr_sink))
+    return result
 
 
 # ── Worker process ────────────────────────────────────────────────────────────
@@ -156,13 +180,21 @@ def run_worker(seed, pop, rank, sigma, lr):
 
 def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
     """Spawn worker processes and coordinate via pipes."""
-    # Partition candidate IDs
-    per_node = pop // nodes
-    shard_ids = [np.arange(i * per_node, (i + 1) * per_node, dtype=np.int32)
-                 for i in range(nodes)]
+    # Partition candidate IDs using the library's largest-remainder splitter so
+    # the shards always sum to ``pop`` exactly, even when ``pop`` is not
+    # divisible by ``nodes`` (see issue #18). Floor-division here previously
+    # dropped the remainder candidates and made step_from_losses reject the
+    # too-short loss array.
+    sizes = compute_partition_sizes(pop, [1.0] * nodes)
+    shard_ids = []
+    offset = 0
+    for size in sizes:
+        shard_ids.append(np.arange(offset, offset + size, dtype=np.int32))
+        offset += size
 
     # Spawn worker processes (copies of this script)
     workers = []
+    stderr_sinks = []
     for i in range(nodes):
         proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--worker",
@@ -176,6 +208,11 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
             stderr=subprocess.PIPE,
             env={**os.environ, "JAX_PLATFORMS": "cpu"},
         )
+        sink: list[str] = []
+        stderr_sinks.append(sink)
+        threading.Thread(
+            target=_drain_stderr, args=(proc, sink), daemon=True
+        ).start()
         workers.append(proc)
 
     # Send batch to each worker (once — cached)
@@ -183,9 +220,9 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
     xor_y = np.array([[0.], [1.], [1.], [0.]], dtype=np.float32)
     batch = (xor_x, xor_y)
 
-    for proc in workers:
+    for proc, sink in zip(workers, stderr_sinks):
         _send(("set_batch", batch), proc.stdin)
-        assert _recv(proc.stdout) == "ok"
+        assert _recv_checked(proc, sink) == "ok"
 
     # Communication accounting
     losses_bytes_per_step = pop * 4  # float32
@@ -194,7 +231,7 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
 
     print(f"Multi-process cluster ZeroGrad")
     print(f"  Nodes: {nodes} (separate Python processes)")
-    print(f"  Population: {pop} ({per_node} per node)")
+    print(f"  Population: {pop} (partition {list(sizes)} per node)")
     print(f"  Communication per step:")
     print(f"    Losses: {losses_bytes_per_step} bytes (shared via pipes)")
     print(f"    Params: {params_bytes} bytes (NOT shared — computed locally)")
@@ -210,8 +247,8 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
             _send(("evaluate", shard_ids[i]), proc.stdin)
 
         all_losses = []
-        for proc in workers:
-            losses = _recv(proc.stdout)
+        for proc, sink in zip(workers, stderr_sinks):
+            losses = _recv_checked(proc, sink)
             all_losses.append(losses)
 
         # 2. Gather losses — ONLY data crossing process boundaries
@@ -222,8 +259,8 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
             _send(("step", gathered), proc.stdin)
 
         metrics_list = []
-        for proc in workers:
-            m = _recv(proc.stdout)
+        for proc, sink in zip(workers, stderr_sinks):
+            m = _recv_checked(proc, sink)
             metrics_list.append(m)
 
         # All workers report identical metrics
@@ -239,8 +276,8 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
         _send(("get_params",), proc.stdin)
 
     worker_params = []
-    for proc in workers:
-        leaves = _recv(proc.stdout)
+    for proc, sink in zip(workers, stderr_sinks):
+        leaves = _recv_checked(proc, sink)
         worker_params.append(leaves)
 
     # Stop workers

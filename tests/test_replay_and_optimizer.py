@@ -7,7 +7,6 @@ import optax
 import pytest
 
 from zerograd import (
-    CandidateContext,
     Manifest,
     ManifestEntry,
     ParameterLayout,

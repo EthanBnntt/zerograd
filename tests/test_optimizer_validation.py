@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import optax
 import pytest
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad, ZeroGradState
+from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
 from zerograd._optimizer import _build_pseudo_grad
 
 
