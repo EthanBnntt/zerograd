@@ -139,3 +139,31 @@ class TestVerificationDrift:
         fc = FaultTolerantCluster(_make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=1)
         fc.step(_batch())
         assert fc.verify_sync()
+
+
+class TestEmptyRegistryGuards:
+    """Regression tests for issue #6: no/crash on empty or all-paused node sets."""
+
+    def test_rejects_initial_nodes_zero(self):
+        with pytest.raises(ValueError):
+            FaultTolerantCluster(_make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=0)
+
+    def test_step_raises_when_all_nodes_paused(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=2)
+        fc.pause_node(0)
+        fc.pause_node(1)
+        with pytest.raises(RuntimeError):
+            fc.step(_batch())
+
+    def test_step_raises_when_registry_empty(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=2)
+        fc.remove_node(1)
+        fc.remove_node(0)
+        with pytest.raises(RuntimeError):
+            fc.step(_batch())
+
+    def test_init_raises_when_registry_empty(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=1)
+        fc.remove_node(0)
+        with pytest.raises(RuntimeError):
+            fc.init()

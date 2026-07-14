@@ -85,6 +85,8 @@ class FaultTolerantCluster:
         initial_nodes: int = 1,
         max_loss_history: int = 0,
     ) -> None:
+        if initial_nodes < 1:
+            raise ValueError("initial_nodes must be >= 1")
         self._optimizer = optimizer
         self._build_params_fn = build_params_fn
         self._loss_fn = loss_fn
@@ -256,6 +258,8 @@ class FaultTolerantCluster:
 
     def init(self) -> ZeroGradState:
         """Return node 0's state (all nodes start identical from seed)."""
+        if not self._statuses:
+            raise RuntimeError("no nodes available; cannot init")
         return self._statuses[0].node.state
 
     # ── Training step ──────────────────────────────────────────────────────
@@ -272,6 +276,8 @@ class FaultTolerantCluster:
         resume). This keeps them in sync if they're still running.
         """
         active_shards = self._get_active_shards()
+        if not active_shards:
+            raise RuntimeError("no active nodes available; cannot step")
 
         # 1. Each active node evaluates its shard
         all_losses = []
