@@ -94,6 +94,8 @@ class FaultTolerantCluster:
 
         # Loss history: list of loss arrays, indexed by generation
         self._loss_history: list[Array] = []
+        # Monotonic count of completed steps (independent of history retention)
+        self._step_count = 0
 
         # Node registry
         self._statuses: list[NodeStatus] = []
@@ -218,7 +220,7 @@ class FaultTolerantCluster:
     @property
     def generation(self) -> int:
         """Current generation (number of completed steps)."""
-        return len(self._loss_history)
+        return self._step_count
 
     @property
     def loss_history_size(self) -> int:
@@ -284,6 +286,7 @@ class FaultTolerantCluster:
         self._loss_history.append(gathered)
         if self._max_loss_history > 0 and len(self._loss_history) > self._max_loss_history:
             self._loss_history = self._loss_history[-self._max_loss_history:]
+        self._step_count += 1
 
         # 4. All nodes step (active + paused ones that are still alive)
         metrics = None
