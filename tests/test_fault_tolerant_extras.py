@@ -167,3 +167,45 @@ class TestEmptyRegistryGuards:
         fc.remove_node(0)
         with pytest.raises(RuntimeError):
             fc.init()
+
+
+class TestLateJoinCatchUp:
+    """Regression tests for issue #2: late-joiner divergence under truncation."""
+
+    def test_refuses_when_history_truncated(self):
+        # max_loss_history=3 with 8 steps drops early generations, so a fresh
+        # node (generation 0) cannot replay the retained tail correctly.
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_params, _loss_fn, seed=42,
+            initial_nodes=2, max_loss_history=3,
+        )
+        for _ in range(8):
+            fc.step(_batch())
+        with pytest.raises(RuntimeError):
+            fc.add_node(name="late")
+
+    def test_catches_up_when_history_complete_within_limit(self):
+        # max_loss_history=10 but only 5 steps taken: history still reaches
+        # generation 0, so a late joiner fully catches up and stays in sync.
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_params, _loss_fn, seed=42,
+            initial_nodes=2, max_loss_history=10,
+        )
+        for _ in range(5):
+            fc.step(_batch())
+        idx = fc.add_node(name="late")
+        assert fc.get_status(idx).last_generation == fc.generation
+        assert fc.verify_sync()
+
+    def test_last_generation_matches_cluster_generation(self):
+        # Unlimited history: last_generation must be the true generation, not
+        # the retained-window size.
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_params, _loss_fn, seed=42, initial_nodes=2,
+        )
+        for _ in range(8):
+            fc.step(_batch())
+        idx = fc.add_node(name="late")
+        assert fc.get_status(idx).last_generation == 8
+        assert fc.get_status(idx).last_generation == fc.nodes[idx].generation
+        assert fc.verify_sync()
