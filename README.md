@@ -11,10 +11,59 @@
 
 ## Installation
 
+Default install is **CPU-only** JAX. Pick exactly one accelerator extra for GPU:
+
+| Extra | Backend | Notes |
+|-------|---------|-------|
+| *(none)* / `cpu` | CPU | Portable default; good for CI and laptops |
+| `cuda` / `cuda12` | NVIDIA CUDA 12 | Pip wheels include CUDA/cuDNN runtime libs |
+| `cuda13` | NVIDIA CUDA 13 | Pip wheels include CUDA/cuDNN runtime libs |
+| `cuda12-local` / `cuda13-local` | NVIDIA CUDA 12/13 | Use a system CUDA toolkit already on `LD_LIBRARY_PATH` |
+| `rocm7` | AMD ROCm 7 | Requires a local ROCm 7.x install; installs the JAX ROCm plugin only |
+
 ```bash
+# CPU (default)
 uv sync
 uv pip install -e ".[dev]"
+
+# NVIDIA CUDA 12 (pip-bundled runtime)
+uv sync --extra cuda12
+uv pip install -e ".[cuda12,dev]"
+
+# NVIDIA CUDA 13
+uv sync --extra cuda13
+
+# System CUDA toolkit (no NVIDIA pip libs)
+uv sync --extra cuda12-local   # or cuda13-local
+
+# AMD ROCm 7 (ROCm must already be installed on the host)
+uv sync --extra rocm7
+uv pip install -e ".[rocm7,dev]"
 ```
+
+With plain pip:
+
+```bash
+pip install -e ".[cpu]"          # or just: pip install -e .
+pip install -e ".[cuda12]"
+pip install -e ".[cuda13]"
+pip install -e ".[cuda12-local]"  # system CUDA
+pip install -e ".[rocm7]"        # system ROCm 7
+```
+
+### ROCm 6
+
+Upstream JAX no longer ships a `rocm6` / `jax[rocm]` extra on current releases
+(`>=0.9` only publish `jax[rocm7-local]`). For ROCm 6.x, install a ROCm-6-compatible
+JAX stack first (see [AMD's JAX on ROCm docs](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/jax-install.html)),
+then install zerograd without a GPU extra so it reuses that JAX:
+
+```bash
+# after AMD/ROCm-6 jax + jaxlib + jax-rocm60-* are installed
+pip install -e ".[dev]"
+```
+
+Do not combine GPU extras (for example `cuda12` and `rocm7`) in one environment.
 
 ## Quick start
 

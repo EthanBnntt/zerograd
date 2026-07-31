@@ -17,11 +17,34 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "jax[rocm7-local]>=0.10.2",
+    # CPU jaxlib by default. Pick exactly one GPU extra for CUDA / ROCm.
+    "jax>=0.10.2",
     "optax>=0.2.8",
 ]
 
 [project.optional-dependencies]
+# Backend extras mirror upstream JAX extras. Install only one GPU backend.
+cpu = [
+    "jax[cpu]>=0.10.2",
+]
+cuda = [
+    "jax[cuda12]>=0.10.2",
+]
+cuda12 = [
+    "jax[cuda12]>=0.10.2",
+]
+cuda13 = [
+    "jax[cuda13]>=0.10.2",
+]
+cuda12-local = [
+    "jax[cuda12-local]>=0.10.2",
+]
+cuda13-local = [
+    "jax[cuda13-local]>=0.10.2",
+]
+rocm7 = [
+    "jax[rocm7-local]>=0.10.2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.0",
@@ -37,4 +60,17 @@ testpaths = ["tests"]
 [dependency-groups]
 dev = [
     "pillow>=12.3.0",
+]
+
+# GPU backends are mutually exclusive — selecting more than one is an error.
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cuda" },
+        { extra = "cuda12" },
+        { extra = "cuda13" },
+        { extra = "cuda12-local" },
+        { extra = "cuda13-local" },
+        { extra = "rocm7" },
+    ],
 ]

@@ -7,9 +7,14 @@ loop or model builder.
 ## Quick start
 
 ```bash
+# CPU default — add a GPU extra if needed: --extra cuda12 | cuda13 | rocm7
 uv sync
 uv pip install -e ".[dev]"
 uv pip install Pillow  # only for CIFAR-10 image loading
+
+# Example: AMD ROCm 7 host
+uv sync --extra rocm7
+uv pip install -e ".[rocm7,dev]"
 ```
 
 ## Scripts
