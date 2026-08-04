@@ -13,12 +13,11 @@ from zerograd import (
     ZeroGrad,
     candidate_key,
     group_key,
-    replay,
-    replay_entry,
     shape_centered_loss,
     step_key,
 )
 from zerograd._factors import matrix_factors, scaled_factor, table_factors, vector_noise
+from zerograd._replay import replay, replay_entry
 
 
 def _make_params():

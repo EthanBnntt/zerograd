@@ -24,10 +24,8 @@ from zerograd import (
     ManifestEntry,
     ParameterLayout,
     ZeroGrad,
-    matrix_factors,
-    table_factors,
-    vector_noise,
 )
+from zerograd._factors import matrix_factors, table_factors, vector_noise
 
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
