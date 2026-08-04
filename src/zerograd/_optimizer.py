@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import inspect
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -113,6 +114,13 @@ class ZeroGrad:
         if args and isinstance(args[0], Manifest):
             # Legacy: ZeroGrad(manifest, transform, population_size, rank, sigma, seed, run_id)
             # Also: ZeroGrad(manifest, transform, population_size=..., rank=..., ...)
+            warnings.warn(
+                "the Manifest-first ZeroGrad(manifest, transform, ...) constructor is "
+                "deprecated; prefer the NNX-first API (ZeroGrad(transform, ...); "
+                "opt.init(model)) which builds the manifest via graph surgery",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             manifest = args[0]
             if len(args) == 7:
                 _, transform, population_size, rank, sigma, seed, run_id = args
@@ -250,6 +258,13 @@ class ZeroGrad:
         run_id: str,
     ) -> ZeroGrad:
         """Construct a dict-param ZeroGrad with an explicit Manifest (legacy API)."""
+        warnings.warn(
+            "ZeroGrad.from_manifest(...) is deprecated; prefer the NNX-first API "
+            "(ZeroGrad(transform, ...); opt.init(model)) which builds the manifest "
+            "via graph surgery",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return cls(manifest, transform, population_size, rank, sigma, seed, run_id)
 
     def init(self, model_or_params: nnx.Module | ParameterTree) -> ZeroGradState:

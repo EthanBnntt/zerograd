@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import jax
@@ -351,6 +352,15 @@ class CandidateContext:
     candidate_key: Array
     rank: int
     sigma: float
+
+    def __post_init__(self) -> None:
+        warnings.warn(
+            "CandidateContext (legacy dict-param LossFn facade) is deprecated; "
+            "prefer the NNX-first API (ZeroGrad(transform, ...); opt.init(model); "
+            "loss_fn(model, batch)) which needs no manifest-lookup facade",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     def key_for(self, path: ParameterPath) -> Array:
         """Return the deterministic group key for one manifest path."""
