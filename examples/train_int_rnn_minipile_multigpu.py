@@ -1,4 +1,4 @@
-"""Four-GPU, loss-only distributed ZeroGrad training for the character GDN.
+"""Four-GPU, loss-only distributed ZeroGrad training for an integer GDN.
 
 Every GPU owns a deterministic model replica. Candidate shards run concurrently;
 only the population loss vector is exchanged. Each GPU replays the same update,
@@ -41,6 +41,12 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--tokenizer-mode",
+        choices=("byte", "qwen"),
+        default="byte",
+    )
+    parser.add_argument("--tokenizer", default=train.DEFAULT_TOKENIZER)
+    parser.add_argument(
         "--checkpoint-out",
         default="checkpoints/int-gdn-char-4gpu-latest.pkl",
     )
@@ -74,7 +80,7 @@ def main() -> None:
     train.CE_PARALLEL = 1
     train.DELTA_CHUNK = args.delta_chunk
 
-    tokenizer = train.ByteTokenizer()
+    tokenizer = train.load_tokenizer(args.tokenizer, mode=args.tokenizer_mode)
     vocab_size = len(tokenizer)
     raw_batcher = train.TokenBatcher(
         train.iter_minipile_token_ids(tokenizer, seed=args.seed),
@@ -98,7 +104,7 @@ def main() -> None:
             population_size=args.population,
             rank=args.rank,
             seed=args.seed,
-            run_id="int-rnn-minipile-char-4gpu",
+            run_id=f"int-rnn-minipile-{args.tokenizer_mode}-4gpu",
             integer_es=True,
             sigma_shift=args.sigma_shift,
             int_bits=train.BITS,
@@ -125,7 +131,8 @@ def main() -> None:
         "alpha_decay": args.alpha_decay,
         "candidate_chunk": args.candidate_chunk,
         "vocab_size": vocab_size,
-        "tokenizer_mode": "byte",
+        "tokenizer": args.tokenizer,
+        "tokenizer_mode": args.tokenizer_mode,
         "seed": args.seed,
     }
 
@@ -147,6 +154,11 @@ def main() -> None:
         loss_fn=train.loss_fn,
     )
     print(f"JAX devices: {devices}", flush=True)
+    print(
+        f"Model parameters: {train.count_params(distributed.model):,}; "
+        f"vocab={vocab_size:,} tokenizer={args.tokenizer_mode}",
+        flush=True,
+    )
     print(
         f"Population partitions: {distributed.partition_sizes}; "
         f"loss communication={distributed.losses_bytes_per_step} bytes/generation",
