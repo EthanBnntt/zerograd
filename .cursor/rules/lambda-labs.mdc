@@ -1,0 +1,69 @@
+---
+description: Connect to and operate Lambda Cloud GPU instances (API, SSH, launch/terminate)
+alwaysApply: true
+---
+
+# Lambda Labs Cloud
+
+Local credentials already exist on this machine. Prefer them over asking the user for keys.
+
+## Credentials (do not commit or paste secrets)
+
+| Path | Purpose |
+|------|---------|
+| `~/.config/lambda/api_key` | Cloud API key |
+| `~/.ssh/lambda.pem` | SSH private key for account key **Lambda SSH** |
+| `~/.config/lambda/README.md` | Longer local notes |
+
+```bash
+export LAMBDA_API_KEY="$(cat ~/.config/lambda/api_key)"
+```
+
+Auth: `Authorization: Bearer $LAMBDA_API_KEY`  
+Base: `https://cloud.lambdalabs.com/api/v1`  
+Docs: https://cloud.lambdalabs.com/api/v1/docs
+
+Use **curl** for API calls. Plain `urllib` without a browser-like User-Agent can get HTTP 403.
+
+## Common API calls
+
+```bash
+# List running instances
+curl -sH "Authorization: Bearer $LAMBDA_API_KEY" \
+  https://cloud.lambdalabs.com/api/v1/instances
+
+# Capacity + types (check regions_with_capacity_available)
+curl -sH "Authorization: Bearer $LAMBDA_API_KEY" \
+  https://cloud.lambdalabs.com/api/v1/instance-types
+
+# Launch (always include ssh_key_names: ["Lambda SSH"])
+curl -sH "Authorization: Bearer $LAMBDA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"region_name":"us-east-1","instance_type_name":"gpu_1x_a10","ssh_key_names":["Lambda SSH"],"quantity":1}' \
+  https://cloud.lambdalabs.com/api/v1/instance-operations/launch
+
+# Terminate
+curl -sH "Authorization: Bearer $LAMBDA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"instance_ids":["INSTANCE_ID"]}' \
+  https://cloud.lambdalabs.com/api/v1/instance-operations/terminate
+```
+
+Account SSH keys: **Lambda SSH** (use with `lambda.pem`), also `miRNA-Interaction-Transformer`.
+
+## SSH
+
+```bash
+ssh -i ~/.ssh/lambda.pem ubuntu@<INSTANCE-IP>
+# Optional alias (HostName may be stale — update from /instances IP first):
+ssh lambda
+```
+
+Default user is `ubuntu`. After launch, wait until the instance is active and has an IP before SSHing.
+
+## Agent habits
+
+- Check `/instances` before launching; avoid duplicate machines.
+- Prefer types with non-empty `regions_with_capacity_available`.
+- Terminate when finished; GPU time is billed while running.
+- Never commit `api_key`, `*.pem`, or instance secrets into the repo.
