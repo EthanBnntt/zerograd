@@ -1235,18 +1235,22 @@ def main():
     history: list[dict] = []
     best_nll = float("inf")
     t_train = time.time()
+    perf_window_start = t_train
+    perf_window_steps = 0
     try:
         for step in range(1, args.steps):
             batch = batcher.next_batch()
-            t0 = time.time()
             model, state, metrics = optimizer.step(state, model, batch, loss_fn)
+            perf_window_steps += 1
+            should_log = step % args.log_every == 0 or step == args.steps - 1
             # Only host-sync on log steps so the GPU can stay busy between prints.
-            if step % args.log_every == 0 or step == args.steps - 1:
+            if should_log:
                 jax.block_until_ready(metrics.mean_loss)
-            dt = time.time() - t0
+                train_window_s = time.time() - perf_window_start
+                dt = train_window_s / perf_window_steps
             gen = int(metrics.generation)
 
-            if step % args.log_every == 0 or step == args.steps - 1:
+            if should_log:
                 nll, ppl = nll_and_ppl(model, batch[0], batch[1])
                 jax.block_until_ready(nll)
                 nll_f, ppl_f = float(nll), float(ppl)
@@ -1289,6 +1293,9 @@ def main():
                         },
                         step=gen,
                     )
+                # Exclude eval/logging from the next asynchronous train window.
+                perf_window_start = time.time()
+                perf_window_steps = 0
 
             if args.gen_every > 0 and gen % args.gen_every == 0:
                 print_sample(
