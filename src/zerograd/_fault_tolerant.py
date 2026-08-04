@@ -37,7 +37,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from ._cluster import ParamsBuilder, ZeroGradNode
+from ._cluster import ParamsBuilder, ZeroGradNode, evaluate_and_step
 from ._distributed import compute_partition_sizes
 from ._manifest import ParameterTree
 from ._optimizer import LossFn, StepMetrics, ZeroGrad, ZeroGradState
@@ -308,31 +308,25 @@ class FaultTolerantCluster:
         if not active_shards:
             raise RuntimeError("no active nodes available; cannot step")
 
-        # 1. Each active node evaluates its shard
-        all_losses = []
-        for status, ids in active_shards:
-            losses = status.node.evaluate(batch, ids)
-            all_losses.append(losses)
+        shards = [(status.node, ids) for status, ids in active_shards]
+        step_statuses = [s for s in self._statuses if s.active or s.paused]
 
-        # 2. Gather losses
-        gathered = jnp.concatenate(all_losses)
+        def _record_history(gathered: Array) -> None:
+            self._loss_history.append(gathered)
+            if self._max_loss_history > 0 and len(self._loss_history) > self._max_loss_history:
+                self._loss_history = self._loss_history[-self._max_loss_history:]
+            self._step_count += 1
 
-        # 3. Store in loss history
-        self._loss_history.append(gathered)
-        if self._max_loss_history > 0 and len(self._loss_history) > self._max_loss_history:
-            self._loss_history = self._loss_history[-self._max_loss_history:]
-        self._step_count += 1
+        params, state, metrics = evaluate_and_step(
+            shards,
+            [s.node for s in step_statuses],
+            batch,
+            on_gathered=_record_history,
+        )
+        for status in step_statuses:
+            status.last_generation = status.node.generation
 
-        # 4. All nodes step (active + paused ones that are still alive)
-        metrics = None
-        for status in self._statuses:
-            if status.active or status.paused:
-                metrics = status.node.step(gathered)
-                status.last_generation = status.node.generation
-
-        # Return from first active node
-        ref = self._statuses[0]
-        return ref.node.params, ref.node.state, metrics
+        return params, state, metrics
 
     # ── Verification ───────────────────────────────────────────────────────
 

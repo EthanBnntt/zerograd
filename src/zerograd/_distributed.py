@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +33,31 @@ from ._nnx import params_pure_dict, update_params
 from ._optimizer import LossFn, ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def gather_shard_losses(
+    executor: ThreadPoolExecutor,
+    shards: Sequence[_T],
+    evaluate_fn: Callable[[_T], _R],
+    *,
+    concat: Callable[[list[_R]], _R],
+    is_empty: Callable[[_T], bool] | None = None,
+) -> _R:
+    """Submit ``evaluate_fn(shard)`` concurrently for each shard, then concatenate in order.
+
+    Shards for which ``is_empty`` returns ``True`` are skipped entirely (no
+    future submitted, nothing to gather) — used by :class:`DistributedZeroGrad`
+    to avoid evaluating a zero-candidate partition.
+    """
+    futures = [
+        None if is_empty is not None and is_empty(shard) else executor.submit(evaluate_fn, shard)
+        for shard in shards
+    ]
+    parts = [future.result() for future in futures if future is not None]
+    return concat(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,27 +296,23 @@ class DistributedZeroGrad:
 
         gen = state.generation
 
-        # Dispatch evaluation to each shard concurrently
-        futures = []
-        for shard in self._shards:
-            ids = shard._candidate_ids
-            if ids is not None and ids.shape[0] > 0:
-                future = self._executor.submit(
-                    shard.evaluate, model_or_params, batch, ids, gen, rng,
-                )
-            else:
-                future = None
-            futures.append(future)
+        def _evaluate(shard: DeviceShard) -> Array:
+            result = shard.evaluate(model_or_params, batch, shard._candidate_ids, gen, rng)
+            return jax.device_put(result.losses, self._coordinator_device)
 
-        # Gather results in shard order (shards already hold sequential candidate ID ranges)
-        all_losses = []
-        for future in futures:
-            if future is None:
-                continue
-            result = future.result()
-            losses = jax.device_put(result.losses, self._coordinator_device)
-            all_losses.append(losses)
-        losses = jnp.concatenate(all_losses)
+        def _shard_is_empty(shard: DeviceShard) -> bool:
+            ids = shard._candidate_ids
+            return ids is None or ids.shape[0] == 0
+
+        # Shards already hold sequential candidate ID ranges, so gathering in
+        # shard order reconstructs the population's loss array directly.
+        losses = gather_shard_losses(
+            self._executor,
+            self._shards,
+            _evaluate,
+            concat=jnp.concatenate,
+            is_empty=_shard_is_empty,
+        )
 
         from flax import nnx
 
@@ -506,18 +527,12 @@ class ReplicatedDistributedZeroGrad:
 
         batch_host = jax.device_get(batch)
         rng_host = jax.device_get(rng)
-        eval_futures = [
-            self._executor.submit(
-                self._evaluate_replica,
-                replica,
-                batch_host,
-                rng_host,
-                generation,
-            )
-            for replica in self._replicas
-        ]
-        loss_parts = [future.result() for future in eval_futures]
-        losses_host = np.concatenate(loss_parts, axis=0)
+        losses_host = gather_shard_losses(
+            self._executor,
+            self._replicas,
+            lambda replica: self._evaluate_replica(replica, batch_host, rng_host, generation),
+            concat=lambda parts: np.concatenate(parts, axis=0),
+        )
         if losses_host.shape != (self._population_size,):
             raise RuntimeError(
                 f"gathered losses have shape {losses_host.shape}, "
