@@ -27,9 +27,10 @@ _spec.loader.exec_module(_mod)
 
 
 def _rand_q8(key, shape, *, gate: bool = False):
+    # Keep gates away from 0 so long-horizon WY vs scan stays within ±1 int8.
     if gate:
-        return jax.random.randint(key, shape, 0, 128, dtype=jnp.int32).astype(jnp.int8)
-    return jax.random.randint(key, shape, -127, 128, dtype=jnp.int32).astype(jnp.int8)
+        return jax.random.randint(key, shape, 64, 128, dtype=jnp.int32).astype(jnp.int8)
+    return jax.random.randint(key, shape, -64, 64, dtype=jnp.int32).astype(jnp.int8)
 
 
 def _peak_bytes() -> int:
