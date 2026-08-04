@@ -259,7 +259,13 @@ def _decay_weighted_dots(
     inv_gamma = jnp.exp(-log_g)
     lhs = left * gamma
     rhs = right * inv_gamma
-    scores = jnp.matmul(lhs, jnp.swapaxes(rhs, -1, -2))
+    # WY's triangular solve amplifies TF32 score error; request true fp32
+    # accumulation here while retaining the dense batched GEMM.
+    scores = jnp.matmul(
+        lhs,
+        jnp.swapaxes(rhs, -1, -2),
+        precision=jax.lax.Precision.HIGHEST,
+    )
     return jnp.tril(scores, k=tril_k)
 
 
