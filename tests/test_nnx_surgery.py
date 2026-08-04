@@ -9,10 +9,12 @@ import pytest
 from flax import nnx
 
 from zerograd import (
+    IntEmbedding,
     IntLinear,
     ParameterLayout,
     ZeroGrad,
     ZgEmbed,
+    ZgIntEmbedding,
     ZgIntLinear,
     ZgLinear,
     ZgTable,
@@ -70,6 +72,27 @@ class TestSurgery:
         model, manifest = apply_surgery(model, rank=2, sigma=0.05)
         assert isinstance(model.emb, ZgEmbed)
         assert any(e.layout is ParameterLayout.TABLE for e in manifest.entries)
+
+    def test_replaces_int_embedding(self):
+        class IntEmbedModel(nnx.Module):
+            def __init__(self, rngs: nnx.Rngs):
+                self.emb = IntEmbedding(16, 4, rngs=rngs)
+                self.head = IntLinear(4, 3, act_dtype=jnp.int32, rngs=rngs)
+
+            def __call__(self, idx):
+                return self.head(self.emb(idx))
+
+        model = IntEmbedModel(nnx.Rngs(0))
+        idx = jnp.arange(4, dtype=jnp.int32)
+        before = model(idx)
+        model, manifest = apply_surgery(model, rank=2, sigma=0.05, integer_es=True)
+        assert isinstance(model.emb, ZgIntEmbedding)
+        assert isinstance(model.head, ZgIntLinear)
+        assert ("emb", "embedding") in {e.path for e in manifest.entries}
+        assert any(e.layout is ParameterLayout.TABLE for e in manifest.entries)
+        model.zg_slot.enabled = False
+        after = model(idx)
+        assert jnp.array_equal(before, after)
 
     def test_wraps_bare_vector_and_marked_table(self):
         model = BareParamModel(nnx.Rngs(0))

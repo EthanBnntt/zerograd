@@ -51,3 +51,14 @@ class TestEggInteger:
         x = jnp.asarray([[-12, -4, 4, 12]], dtype=jnp.int8)
         # Mean is zero and Q4 scale 16 represents identity.
         np.testing.assert_array_equal(np.asarray(affine(x)), np.asarray(x))
+
+    def test_int_embedding_egg_init_and_lookup(self):
+        from zerograd import IntEmbedding
+
+        emb = IntEmbedding(8, 4, rngs=nnx.Rngs(0))
+        assert emb.embedding[...].dtype == jnp.int8
+        assert int(emb.embedding[...].min()) >= EGG_I8_MIN
+        assert int(emb.embedding[...].max()) <= EGG_I8_MAX
+        idx = jnp.asarray([0, 3, 7], dtype=jnp.int32)
+        rows = emb(idx)
+        np.testing.assert_array_equal(np.asarray(rows), np.asarray(emb.embedding[...])[idx])

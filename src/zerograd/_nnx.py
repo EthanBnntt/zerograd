@@ -922,10 +922,115 @@ class IntAffine(nnx.Module):
         )
 
 
+class IntEmbedding(nnx.Module):
+    """Pure-integer embedding table (Appendix G / EGG).
+
+    Rows init as ``round(16·N(0,1))`` clipped to ±127. Lookup is a gather; no
+    requantize is applied (table values are already int8 activations).
+
+    Surgery replaces this with :class:`ZgIntEmbedding` (row-sparse ES factors).
+    Prefer this over ``nnx.Embed`` + custom init for integer LMs.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        features: int,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        self.num_embeddings = int(num_embeddings)
+        self.features = int(features)
+        table = egg_init_matrix(rngs.params(), (self.num_embeddings, self.features))
+        self.embedding = mark_table(nnx.Param(table))
+
+    def __call__(self, indices: Array) -> Array:
+        return self.embedding[...][indices]
+
+    def attend(self, query: Array) -> Array:
+        """Tied-logit projection: ``query @ embedding.T`` in int32."""
+        return int_matmul(query, self.embedding[...].T)
+
+
+class ZgIntEmbedding(nnx.Module):
+    """``IntEmbedding`` with Appendix H row-sparse int8 table perturbations."""
+
+    def __init__(self, embed: IntEmbedding, slot: ZeroGradSlot, group: str) -> None:
+        self.embedding = embed.embedding
+        self.num_embeddings = embed.num_embeddings
+        self.features = embed.features
+        self.slot = slot
+        self.group = group
+
+    def __call__(self, indices: Array) -> Array:
+        return self.lookup(indices, factors=None)
+
+    def candidate_factors(self) -> tuple[Array, Array] | None:
+        """Generate this candidate's table factors once for reuse by a loss."""
+        slot = self.slot
+        if not slot.enabled:
+            return None
+        from ._factors import int_table_factors
+
+        return int_table_factors(
+            _factor_key(slot, self.group),
+            self.embedding[...].shape,
+            slot.rank,
+        )
+
+    def lookup(
+        self,
+        indices: Array,
+        *,
+        factors: tuple[Array, Array] | None,
+    ) -> Array:
+        """Gather rows, optionally reusing :meth:`candidate_factors` output."""
+        table = self.embedding[...]
+        slot = self.slot
+        if not slot.enabled:
+            return table[indices]
+        if factors is None:
+            return perturbed_int_table_lookup(
+                table,
+                indices,
+                _factor_key(slot, self.group),
+                slot.rank,
+                slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+        a, b = factors
+        return perturbed_int_table_lookup_prepared(
+            table,
+            indices,
+            a,
+            b,
+            slot.sigma_shift,
+            factor_sign=slot.factor_sign[...],
+        )
+
+    def attend(self, query: Array) -> Array:
+        """Tied-logit projection using the same table factors as ``__call__``."""
+        table = self.embedding[...]
+        slot = self.slot
+        if slot.enabled:
+            idx = jnp.arange(table.shape[0], dtype=jnp.int32)
+            e = perturbed_int_table_lookup(
+                table,
+                idx,
+                _factor_key(slot, self.group),
+                slot.rank,
+                slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+            return int_matmul(query, e.T)
+        return int_matmul(query, table.T)
+
+
 class ZgEmbed(nnx.Module):
     """``nnx.Embed`` replacement with factor-only table perturbations.
 
     Integer tables use Appendix H row-sparse gathers (no full ``A[V,r]`` alloc).
+    Prefer :class:`IntEmbedding` / :class:`ZgIntEmbedding` for EGG int8 LMs.
     """
 
     def __init__(self, embed: nnx.Embed, slot: ZeroGradSlot, group: str) -> None:
@@ -1164,6 +1269,7 @@ def _is_surged(module: object) -> bool:
             ZgIntLinear,
             ZgIntLUT,
             ZgIntSpatialProj,
+            ZgIntEmbedding,
             ZgTernaryLinear,
             ZgEmbed,
             ZgLayerNorm,
@@ -1304,6 +1410,13 @@ def apply_surgery(
                     ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
                 )
                 setattr(module, name, ZgIntSpatialProj(value, slot, kg, bg))
+            elif isinstance(value, IntEmbedding):
+                leaf = _path_tuple(child_path)
+                g = _path_str(child_path + ("embedding",))
+                entries.append(
+                    ManifestEntry(leaf + ("embedding",), ParameterLayout.TABLE, g)
+                )
+                setattr(module, name, ZgIntEmbedding(value, slot, g))
             elif isinstance(value, nnx.Embed):
                 leaf = _path_tuple(child_path)
                 g = _path_str(child_path + ("embedding",))

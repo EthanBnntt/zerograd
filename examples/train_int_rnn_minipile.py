@@ -4,7 +4,7 @@ Architecture (all int8 until the head). The main block is ``IntLinearLUT``:
 
   int8 @ int8 → int32 accum → int8 requant → learnable IntLUT
 
-  Qwen3.6 subword ids → int8 ``nnx.Embed`` (surgery → ``ZgEmbed``)
+  Qwen3.6 subword ids → int8 ``IntEmbedding`` (surgery → ``ZgIntEmbedding``)
   → ×L IntDeltaBlock:
         pre-norm → multi-head **Gated Delta Rule-2** scan → residual
         pre-norm → int8 MLP (IntLinearLUT²) → residual
@@ -57,13 +57,14 @@ from flax import nnx
 
 from zerograd import (
     IntAffine,
+    IntEmbedding,
     IntLinear,
     IntLinearLUT,
     IntLUT,
     ZeroGrad,
     egg_clip_cast,
 )
-from zerograd._integer import egg_init_matrix, egg_matmul_divisor, int_matmul
+from zerograd._integer import egg_matmul_divisor, int_matmul
 from zerograd._nnx import LayerIndex, disable_candidates, params_pure_dict, update_params
 
 # ── Architecture defaults (overridden by CLI via ``configure_architecture``) ─
@@ -468,12 +469,6 @@ def _scan_delta_layer(x: jax.Array, layer: IntDeltaBlock) -> jax.Array:
     return layer(x)
 
 
-def _egg_embed_init(rng: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype) -> jax.Array:
-    """EGG int8 embedding init for ``nnx.Embed``."""
-    del dtype
-    return egg_init_matrix(rng, shape)
-
-
 class IntRnnLM(nnx.Module):
     """``NUM_LAYERS``-deep pure-integer causal LM (Gated DeltaNet-2 + int8 MLP)."""
 
@@ -487,15 +482,8 @@ class IntRnnLM(nnx.Module):
     ):
         self.vocab_size = int(vocab_size)
         self.delta_impl = delta_impl
-        # nnx.Embed → surgery → ZgEmbed (learnable TABLE, row-sparse ES factors).
-        self.embed = nnx.Embed(
-            num_embeddings=self.vocab_size,
-            features=EMBED_DIM,
-            dtype=jnp.int8,
-            param_dtype=jnp.int8,
-            embedding_init=_egg_embed_init,
-            rngs=rngs,
-        )
+        # IntEmbedding → surgery → ZgIntEmbedding (TABLE, row-sparse ES factors).
+        self.embed = IntEmbedding(self.vocab_size, EMBED_DIM, rngs=rngs)
         layers = int(num_layers)
 
         @nnx.split_rngs(splits=layers)
