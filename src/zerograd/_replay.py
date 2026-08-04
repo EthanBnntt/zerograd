@@ -268,18 +268,6 @@ def replay_integer(
     return result
 
 
-def replay_integer_tiled(
-    params: ParameterTree,
-    manifest: Manifest,
-    base_key: Array,
-    pair_ids: Array,
-    shaped_weights: Array,
-    rank: int,
-) -> dict[str, "jax.Array | dict"]:
-    """Alias for :func:`replay_integer` (int table leaves are internally tiled)."""
-    return replay_integer(params, manifest, base_key, pair_ids, shaped_weights, rank)
-
-
 def _insert_nested(tree: dict, path: tuple[str, ...], value: "jax.Array") -> None:
     """Insert a value at a nested tuple path into a dict tree."""
     node = tree

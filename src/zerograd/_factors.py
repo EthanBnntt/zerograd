@@ -145,17 +145,6 @@ def int_table_factors(key: Array, shape: Sequence[int], rank: int) -> tuple[Arra
     )
 
 
-def int_table_factors_for_rows(
-    key: Array,
-    shape: Sequence[int],
-    rank: int,
-    row_ids: Array,
-) -> tuple[Array, Array]:
-    """``A[row_ids]`` via bulk ``int_table_factors`` then gather (exact match)."""
-    a, b = int_table_factors(key, shape, rank)
-    return a[jnp.asarray(row_ids, dtype=jnp.int32)], b
-
-
 def vector_noise(key: Array, shape: Sequence[int], *, dtype: jnp.dtype) -> Array:
     """Draw IID standard-normal perturbation for a one-dimensional leaf."""
     (size,) = _validate_shape(shape, 1, "vector shape")
