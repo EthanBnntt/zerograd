@@ -1480,12 +1480,19 @@ def bind_candidate(
     sign = jnp.asarray(factor_sign, dtype=jnp.int32)
     # State values must be replaced before entering the candidate's trace
     # context; mutating a merged Variable under vmap raises TraceContextError.
-    pure = state.to_pure_dict()
-    new_pure = _set_slot_binding(pure, candidate_key_val, sign)
-    model = nnx.merge(graphdef, state)
-    g, st = nnx.split(model)
-    st.replace_by_pure_dict(new_pure)
-    model = nnx.merge(g, st)
+    # Clone only the two slot Variables in flattened state and merge once.
+    # This avoids full state -> dict recursion plus an extra merge/split/merge
+    # cycle in every candidate trace.
+    flat_state = []
+    for path, variable in state.flat_state():
+        if len(path) >= 2 and path[-2] in ("slot", "zg_slot"):
+            if path[-1] == "key":
+                variable = variable.replace(candidate_key_val)
+            elif path[-1] == "factor_sign":
+                variable = variable.replace(sign)
+        flat_state.append((path, variable))
+    bound_state = type(state).from_flat_path(flat_state)
+    model = nnx.merge(graphdef, bound_state)
     if hasattr(model, "zg_slot") and isinstance(model.zg_slot, ZeroGradSlot):
         model.zg_slot.enabled = enabled
     return model

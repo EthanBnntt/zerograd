@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -428,6 +429,7 @@ class ZeroGrad:
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
         graphdef, state = nnx.split(model)
         pop = self._population_size
+        accepts_rng = _model_loss_accepts_rng(loss_fn)
 
         def evaluate_candidate(candidate_id: Array) -> Array:
             if self._integer_es:
@@ -439,7 +441,13 @@ class ZeroGrad:
                 sign = 1
             candidate_rng = jax.random.fold_in(rng, candidate_id)
             bound = bind_candidate(graphdef, state, ck, enabled=True, factor_sign=sign)
-            loss, _aux = _call_model_loss(loss_fn, bound, batch, candidate_rng)
+            loss, _aux = _call_model_loss(
+                loss_fn,
+                bound,
+                batch,
+                candidate_rng,
+                accepts_rng=accepts_rng,
+            )
             return loss
 
         return _map_candidates(
@@ -468,6 +476,7 @@ class ZeroGrad:
         half = pop // 2
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
         graphdef, model_state = nnx.split(model)
+        accepts_rng = _model_loss_accepts_rng(loss_fn)
         signs = jnp.asarray((1, -1), dtype=jnp.int32)
         sign_offsets = jnp.asarray((0, half), dtype=jnp.int32)
 
@@ -481,7 +490,13 @@ class ZeroGrad:
                 bound = bind_candidate(
                     graphdef, model_state, ck, enabled=True, factor_sign=sign
                 )
-                loss, _aux = _call_model_loss(loss_fn, bound, batch, candidate_rng)
+                loss, _aux = _call_model_loss(
+                    loss_fn,
+                    bound,
+                    batch,
+                    candidate_rng,
+                    accepts_rng=accepts_rng,
+                )
                 return loss
 
             return jax.vmap(evaluate_sign)((signs, sign_offsets))
@@ -758,13 +773,42 @@ def _is_identity_transform(transform: optax.GradientTransformation) -> bool:
 
 
 def _call_model_loss(
-    loss_fn: ModelLossFn, model: nnx.Module, batch: Any, rng: Array
+    loss_fn: ModelLossFn,
+    model: nnx.Module,
+    batch: Any,
+    rng: Array,
+    *,
+    accepts_rng: bool | None = None,
 ) -> tuple[Array, Any]:
     """Call ``loss_fn(model, batch)`` or ``loss_fn(model, batch, rng)``."""
-    try:
+    if accepts_rng is None:
+        accepts_rng = _model_loss_accepts_rng(loss_fn)
+    if accepts_rng:
         return loss_fn(model, batch, rng)
-    except TypeError:
-        return loss_fn(model, batch)
+    return loss_fn(model, batch)
+
+
+def _model_loss_accepts_rng(loss_fn: ModelLossFn) -> bool:
+    """Inspect a loss callable once, outside JAX transforms.
+
+    The old try/except path intentionally raised a ``TypeError`` while tracing
+    every two-argument loss and could also swallow a real TypeError from inside
+    the model.  Signature dispatch keeps candidate traces small and errors
+    precise.
+    """
+    try:
+        parameters = tuple(inspect.signature(loss_fn).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters):
+        return True
+    positional = tuple(
+        p
+        for p in parameters
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    return len(positional) >= 3
 
 
 def _tree_sig(tree: Any) -> Any:
