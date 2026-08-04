@@ -481,22 +481,48 @@ class IntRnnLM(nnx.Module):
         )
         self.norm_f = IntAffine(EMBED_DIM, bits=BITS, egg=True, rngs=rngs)
 
-    def encode(self, tokens: jax.Array) -> jax.Array:
+    def _prepare_embed_factors(self) -> tuple[jax.Array, jax.Array] | None:
+        prepare = getattr(self.embed, "candidate_factors", None)
+        return prepare() if prepare is not None else None
+
+    def _embed_rows(
+        self,
+        indices: jax.Array,
+        factors: tuple[jax.Array, jax.Array] | None,
+    ) -> jax.Array:
+        lookup = getattr(self.embed, "lookup", None)
+        if lookup is not None:
+            return lookup(indices, factors=factors)
+        return self.embed(indices)
+
+    def encode(
+        self,
+        tokens: jax.Array,
+        *,
+        embed_factors: tuple[jax.Array, jax.Array] | None = None,
+    ) -> jax.Array:
         """Token ids → int8 hidden states ``[B, T, D]`` (no vocab projection)."""
-        x = self.embed(tokens)
+        x = self._embed_rows(tokens, embed_factors)
         # No positional embeddings — recurrence carries order.
         for layer in self.layers:
             x = layer(x)
         return self.norm_f(x)
 
-    def _logits_chunk(self, h: jax.Array, start: int, size: int) -> jax.Array:
+    def _logits_chunk(
+        self,
+        h: jax.Array,
+        start: int,
+        size: int,
+        *,
+        embed_factors: tuple[jax.Array, jax.Array] | None = None,
+    ) -> jax.Array:
         """Float logits for vocab slice ``[start, start+size)``; pad past ``V`` with -inf."""
         v = self.vocab_size
         idx = start + jnp.arange(size)
         valid = idx < v
         idx_c = jnp.minimum(idx, jnp.maximum(v - 1, 0))
         # Gather (factor-perturbed under ES) then int8×int8→int32 attend.
-        e_c = self.embed(idx_c)  # [C, D]
+        e_c = self._embed_rows(idx_c, embed_factors)  # [C, D]
         logits_i32 = int_matmul(h, e_c.T) // EGG_DIV
         logits = logits_i32.astype(jnp.float32) / LOGIT_SCALE
         neg_inf = jnp.asarray(-1.0e9, dtype=jnp.float32)
@@ -504,12 +530,17 @@ class IntRnnLM(nnx.Module):
 
     def last_logits(self, tokens: jax.Array, *, chunk_size: int = 4096) -> jax.Array:
         """Float logits for the last position only ``[B, V]`` (chunked, VRAM-safe)."""
-        h = self.encode(tokens)[:, -1:, :]  # [B, 1, D]
+        embed_factors = self._prepare_embed_factors()
+        h = self.encode(tokens, embed_factors=embed_factors)[:, -1:, :]  # [B, 1, D]
         v = self.vocab_size
         parts: list[jax.Array] = []
         for start in range(0, v, chunk_size):
             size = min(chunk_size, v - start)
-            parts.append(self._logits_chunk(h, start, size)[:, 0, :])
+            parts.append(
+                self._logits_chunk(
+                    h, start, size, embed_factors=embed_factors
+                )[:, 0, :]
+            )
         return jnp.concatenate(parts, axis=-1)
 
     def chunked_nll(
@@ -525,14 +556,19 @@ class IntRnnLM(nnx.Module):
         ``ce_parallel>1`` evaluates multiple vocab tiles concurrently (higher
         SM util / VRAM) then reduces with ``logsumexp``.
         """
-        h = self.encode(tokens)  # [B, T, D]
+        # Input, target, and every vocabulary chunk share one exact A/B draw.
+        # Previously each gather regenerated A[V,r], dominating large-vocab ES.
+        embed_factors = self._prepare_embed_factors()
+        h = self.encode(tokens, embed_factors=embed_factors)  # [B, T, D]
         v = self.vocab_size
         n_chunks = (v + chunk_size - 1) // chunk_size
         chunk_ids = jnp.arange(n_chunks, dtype=jnp.int32)
 
         def one_chunk(i):
             start = i * chunk_size
-            logits = self._logits_chunk(h, start, chunk_size)
+            logits = self._logits_chunk(
+                h, start, chunk_size, embed_factors=embed_factors
+            )
             return jax.nn.logsumexp(logits, axis=-1)
 
         par = int(ce_parallel)
@@ -542,7 +578,7 @@ class IntRnnLM(nnx.Module):
             lse_parts = jax.lax.map(one_chunk, chunk_ids, batch_size=par)
         lse = jax.nn.logsumexp(lse_parts, axis=0)
         # Target logit via gathered embed row (same factors as chunk path).
-        e_t = self.embed(targets)  # [B, T, D]
+        e_t = self._embed_rows(targets, embed_factors)  # [B, T, D]
         t_logit = (
             jnp.sum(h.astype(jnp.int32) * e_t.astype(jnp.int32), axis=-1) // EGG_DIV
         ).astype(jnp.float32) / LOGIT_SCALE
@@ -550,10 +586,11 @@ class IntRnnLM(nnx.Module):
 
     def __call__(self, tokens: jax.Array) -> jax.Array:
         """Full ``[B, T, V]`` logits — avoid in training (OOM on large V)."""
-        h = self.encode(tokens)
+        embed_factors = self._prepare_embed_factors()
+        h = self.encode(tokens, embed_factors=embed_factors)
         v = self.vocab_size
         # Prefer last_logits / chunked_nll; this path is for tiny-V debugging only.
-        e = self.embed(jnp.arange(v, dtype=jnp.int32))
+        e = self._embed_rows(jnp.arange(v, dtype=jnp.int32), embed_factors)
         logits_i32 = int_matmul(h, e.T) // EGG_DIV
         return logits_i32.astype(jnp.float32) / LOGIT_SCALE
 

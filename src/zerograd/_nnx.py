@@ -20,9 +20,11 @@ from ._candidate import (
     perturbed_int_conv,
     perturbed_int_linear,
     perturbed_int_table_lookup,
+    perturbed_int_table_lookup_prepared,
     perturbed_int_vector,
     perturbed_linear,
     perturbed_table_lookup,
+    perturbed_table_lookup_prepared,
     perturbed_tied_logits,
     perturbed_vector,
 )
@@ -973,9 +975,44 @@ class ZgEmbed(nnx.Module):
         self.group = group
 
     def __call__(self, indices: Array) -> Array:
+        return self.lookup(indices, factors=None)
+
+    def candidate_factors(self) -> tuple[Array, Array] | None:
+        """Generate this candidate's table factors once for reuse by a loss.
+
+        Returns ``None`` when candidate perturbations are disabled.
+        """
         table = self.embedding[...]
         slot = self.slot
-        if slot.enabled:
+        if not slot.enabled:
+            return None
+        if jnp.issubdtype(table.dtype, jnp.integer):
+            from ._factors import int_table_factors
+
+            return int_table_factors(
+                _factor_key(slot, self.group), table.shape, slot.rank
+            )
+        from ._factors import table_factors
+
+        return table_factors(
+            _factor_key(slot, self.group),
+            table.shape,
+            slot.rank,
+            dtype=table.dtype,
+        )
+
+    def lookup(
+        self,
+        indices: Array,
+        *,
+        factors: tuple[Array, Array] | None,
+    ) -> Array:
+        """Gather rows, optionally reusing :meth:`candidate_factors` output."""
+        table = self.embedding[...]
+        slot = self.slot
+        if not slot.enabled:
+            return table[indices]
+        if factors is None:
             if jnp.issubdtype(table.dtype, jnp.integer):
                 return perturbed_int_table_lookup(
                     table,
@@ -988,7 +1025,23 @@ class ZgEmbed(nnx.Module):
             return perturbed_table_lookup(
                 table, indices, _factor_key(slot, self.group), slot.rank, slot.sigma
             )
-        return table[indices]
+        a, b = factors
+        if jnp.issubdtype(table.dtype, jnp.integer):
+            return perturbed_int_table_lookup_prepared(
+                table,
+                indices,
+                a,
+                b,
+                slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+        return perturbed_table_lookup_prepared(
+            table,
+            indices,
+            a,
+            b,
+            slot.sigma,
+        )
 
     def attend(self, query: Array) -> Array:
         """Tied-logit projection using the same table factors as ``__call__``."""
@@ -1425,6 +1478,8 @@ def bind_candidate(
 ) -> nnx.Module:
     """Merge graph state with ``candidate_key`` / antithetical sign on the shared slot."""
     sign = jnp.asarray(factor_sign, dtype=jnp.int32)
+    # State values must be replaced before entering the candidate's trace
+    # context; mutating a merged Variable under vmap raises TraceContextError.
     pure = state.to_pure_dict()
     new_pure = _set_slot_binding(pure, candidate_key_val, sign)
     model = nnx.merge(graphdef, state)

@@ -61,9 +61,12 @@ class StepMetrics:
     """Population diagnostics returned by ``ZeroGrad.step``."""
 
     generation: int
-    mean_loss: float
-    min_loss: float
-    max_loss: float
+    # Device scalar arrays are intentional: converting these to Python floats
+    # inside every step serialized the entire GPU queue three times.  Callers
+    # naturally synchronize when they print/log a metric.
+    mean_loss: Array
+    min_loss: Array
+    max_loss: Array
     population_size: int
 
 
@@ -101,6 +104,7 @@ class ZeroGrad:
         int_bits: int = 8,
         candidate_chunk_size: int | None = None,
         int_bin_updates: bool = False,
+        check_finite: bool = True,
     ) -> None:
         # Resolve NNX-style and legacy positional / keyword forms.
         if args and isinstance(args[0], Manifest):
@@ -202,6 +206,8 @@ class ZeroGrad:
             raise ValueError(
                 f"candidate_chunk_size must be None or an int >= 1, got {candidate_chunk_size!r}"
             )
+        if not isinstance(check_finite, bool):
+            raise TypeError(f"check_finite must be bool, got {check_finite!r}")
 
         self._manifest = manifest
         self._transform = transform
@@ -219,6 +225,7 @@ class ZeroGrad:
         # None → vmap whole population (fast, high VRAM). Int → jax.lax.map chunks
         # (slower, peak activations ≈ chunk_size × one forward).
         self._candidate_chunk_size = candidate_chunk_size
+        self._check_finite = check_finite
         # Appendix H bin updates when integer_es uses the identity transform.
         # Mixed mode (ternary, or int_bin_updates=True): ±1 bins on integer leaves,
         # Adam on float leaves — needed so int8 LUTs/kernels move under small Adam LRs.
@@ -439,6 +446,61 @@ class ZeroGrad:
             evaluate_candidate, candidate_ids, chunk_size=self._candidate_chunk_size
         )
 
+    def _evaluate_antithetical_nnx(
+        self,
+        model: nnx.Module,
+        generation: int,
+        loss_fn: ModelLossFn,
+        batch: Any,
+        *,
+        rng: Array,
+    ) -> Array:
+        """Evaluate the full integer-ES population as dense ``[pair, sign]`` batches.
+
+        The perturbation key depends on ``pair`` while only ``factor_sign`` and
+        the model activations vary across the inner sign axis.  Nesting the sign
+        vmap lets JAX hoist factor generation out of that axis, so antithetical
+        candidates share their A/B factors instead of regenerating identical
+        random tensors twice.
+        """
+        assert self._manifest is not None
+        pop = self._population_size
+        half = pop // 2
+        base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
+        graphdef, model_state = nnx.split(model)
+        signs = jnp.asarray((1, -1), dtype=jnp.int32)
+        sign_offsets = jnp.asarray((0, half), dtype=jnp.int32)
+
+        def evaluate_pair(pair_id: Array) -> Array:
+            ck = candidate_key(base_key, pair_id)
+
+            def evaluate_sign(sign_and_offset: tuple[Array, Array]) -> Array:
+                sign, offset = sign_and_offset
+                candidate_id = pair_id + offset
+                candidate_rng = jax.random.fold_in(rng, candidate_id)
+                bound = bind_candidate(
+                    graphdef, model_state, ck, enabled=True, factor_sign=sign
+                )
+                loss, _aux = _call_model_loss(loss_fn, bound, batch, candidate_rng)
+                return loss
+
+            return jax.vmap(evaluate_sign)((signs, sign_offsets))
+
+        # candidate_chunk_size is expressed in candidates; one pair contributes
+        # two candidates to the inner dense sign axis.
+        pair_chunk = (
+            None
+            if self._candidate_chunk_size is None
+            else max(1, self._candidate_chunk_size // 2)
+        )
+        pair_losses = _map_candidates(
+            evaluate_pair,
+            jnp.arange(half, dtype=jnp.int32),
+            chunk_size=pair_chunk,
+        )
+        # Preserve the public ordering: all + candidates, then all - candidates.
+        return jnp.concatenate((pair_losses[:, 0], pair_losses[:, 1]), axis=0)
+
     def _jit_update_bin_params(self, params: ParameterTree, thresholds: ParameterTree):
         """JIT the bin-update path once per params shape (cached on the instance).
 
@@ -457,6 +519,51 @@ class ZeroGrad:
 
             jit_fn = jax.jit(_update)
             self._bin_update_jit_cache[sig] = jit_fn
+        return jit_fn
+
+    def _jit_integer_bin_step(self, params: ParameterTree):
+        """Compile replay + thresholded bin update as one device program.
+
+        Keeping replay and update in separate eager dispatches materialized an
+        int32 evidence tree (roughly 4× the int8 model size) and launched one
+        program per manifest leaf.  The combined executable can schedule leaves
+        together and consume each evidence tensor directly into its bin update.
+        """
+        if not hasattr(self, "_integer_bin_step_jit_cache"):
+            self._integer_bin_step_jit_cache: dict = {}
+
+        sig = _tree_sig(params)
+        jit_fn = self._integer_bin_step_jit_cache.get(sig)
+        if jit_fn is None:
+            assert self._manifest is not None
+            manifest = self._manifest
+            rank = self._rank
+            half = self._population_size // 2
+            pair_ids = jnp.arange(half, dtype=jnp.int32)
+            from ._integer import qrange
+
+            qmin, qmax = qrange(self._int_bits)
+
+            def replay_and_update(params_p, losses_p, base_key_p, thresholds_p):
+                shaped_p = shape_antithetical_loss(losses_p)
+                evidence_p = replay_integer(
+                    params_p,
+                    manifest,
+                    base_key_p,
+                    pair_ids,
+                    shaped_p,
+                    rank,
+                )
+                return apply_bin_updates(
+                    params_p,
+                    evidence_p,
+                    thresholds_p,
+                    qmin=qmin,
+                    qmax=qmax,
+                )
+
+            jit_fn = jax.jit(replay_and_update)
+            self._integer_bin_step_jit_cache[sig] = jit_fn
         return jit_fn
 
     def step_from_losses(
@@ -487,7 +594,7 @@ class ZeroGrad:
 
     def _check_losses(self, losses: Array) -> None:
         """Validate candidate losses (dtype, finiteness, count)."""
-        validate_losses(losses)
+        validate_losses(losses, check_finite=self._check_finite)
         if losses.shape[0] != self._population_size:
             raise ValueError(
                 f"losses must have {self._population_size} entries, got {losses.shape[0]}"
@@ -507,10 +614,6 @@ class ZeroGrad:
         if self._bin_updates or self._int_bin_updates:
             half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
-            shaped = shape_antithetical_loss(losses)
-            evidence = replay_integer(
-                params, self._manifest, base_key, pair_ids, shaped, self._rank
-            )
             alpha = update_alpha_schedule(
                 generation, base=self._update_alpha, decay=self._alpha_decay
             )
@@ -522,15 +625,20 @@ class ZeroGrad:
                 alpha=alpha_clip,
                 num_directions=half,
             )
-            from ._integer import qrange
-
-            qmin, qmax = qrange(self._int_bits)
-            # JIT the full-tree bin update so it runs as one device program.
-            update_fn = self._jit_update_bin_params(params, thresholds)
-            new_params = update_fn(params, evidence)
             if self._bin_updates:
+                # Pure integer path: compile replay and update together so the
+                # full int32 evidence tree never crosses a dispatch boundary.
+                update_fn = self._jit_integer_bin_step(params)
+                new_params = update_fn(params, losses, base_key, thresholds)
                 new_opt_state = None
             else:
+                shaped = shape_antithetical_loss(losses)
+                evidence = replay_integer(
+                    params, self._manifest, base_key, pair_ids, shaped, self._rank
+                )
+                # Mixed path also needs float-leaf evidence below.
+                update_fn = self._jit_update_bin_params(params, thresholds)
+                new_params = update_fn(params, evidence)
                 # Mixed int bins + AdamW: bin-flip integer leaves, Adam float leaves.
                 shaped_f = shape_centered_loss(losses, self._sigma)
                 pair_weights = shaped_f[:half] - shaped_f[half:]
@@ -576,9 +684,9 @@ class ZeroGrad:
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
         metrics = StepMetrics(
             generation=generation,
-            mean_loss=float(jnp.mean(losses)),
-            min_loss=float(jnp.min(losses)),
-            max_loss=float(jnp.max(losses)),
+            mean_loss=jnp.mean(losses),
+            min_loss=jnp.min(losses),
+            max_loss=jnp.max(losses),
             population_size=self._population_size,
         )
         return new_params, new_state, metrics
@@ -603,10 +711,14 @@ class ZeroGrad:
 
         if isinstance(model_or_params, nnx.Module):
             model = model_or_params
-            losses = self._evaluate_shard_nnx(
-                model, generation, loss_fn, batch, candidate_ids, rng=rng
-            )
-            self._check_losses(losses)
+            if self._integer_es:
+                losses = self._evaluate_antithetical_nnx(
+                    model, generation, loss_fn, batch, rng=rng
+                )
+            else:
+                losses = self._evaluate_shard_nnx(
+                    model, generation, loss_fn, batch, candidate_ids, rng=rng
+                )
             return self.step_from_losses(state, model, losses)
 
         assert self._manifest is not None

@@ -139,7 +139,7 @@ def threshold_tree_for_manifest(
 def apply_bin_updates(
     params: Array | dict,
     evidence: Array | dict,
-    threshold: int | dict,
+    threshold: int | Array | dict,
     *,
     qmin: int | None = None,
     qmax: int | None = None,
@@ -175,7 +175,8 @@ def apply_bin_updates(
         else:
             lo, hi = int(info.min), int(info.max)
         step = jnp.sign(evidence.astype(jnp.int32))
-        mask = (jnp.abs(evidence.astype(jnp.int32)) > int(threshold)).astype(jnp.int32)
+        threshold_i32 = jnp.asarray(threshold, dtype=jnp.int32)
+        mask = (jnp.abs(evidence.astype(jnp.int32)) > threshold_i32).astype(jnp.int32)
         delta = step * mask
         return jnp.clip(params.astype(jnp.int32) + delta, lo, hi).astype(params.dtype)
     return params

@@ -221,6 +221,41 @@ def perturbed_int_table_lookup(
     if table.ndim != 2:
         raise ValueError("table weights must be two-dimensional")
     a, b = int_table_factors(key, table.shape, rank)
+    return perturbed_int_table_lookup_prepared(
+        table,
+        indices,
+        a,
+        b,
+        sigma_shift,
+        factor_sign=factor_sign,
+    )
+
+
+def perturbed_int_table_lookup_prepared(
+    table: Array,
+    indices: Array,
+    a: Array,
+    b: Array,
+    sigma_shift: int,
+    *,
+    factor_sign: Array | int = 1,
+) -> Array:
+    """Gather an integer table using factors generated once for the candidate.
+
+    This is algebraically identical to :func:`perturbed_int_table_lookup` but
+    lets callers reuse ``A[rows, rank]`` and ``B[cols, rank]`` across input
+    embedding, target lookup, and every chunk of a tied vocabulary head.
+    """
+    if table.ndim != 2:
+        raise ValueError("table weights must be two-dimensional")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("prepared table factors must be two-dimensional")
+    if a.shape[0] != table.shape[0] or b.shape[0] != table.shape[1]:
+        raise ValueError("prepared table factors are incompatible with table shape")
+    if a.shape[1] != b.shape[1]:
+        raise ValueError("prepared table factors must share the same rank")
+    if not isinstance(sigma_shift, int) or isinstance(sigma_shift, bool) or sigma_shift < 0:
+        raise ValueError(f"sigma_shift must be a non-negative int, got {sigma_shift!r}")
     sign = jnp.asarray(factor_sign, dtype=jnp.int32)
     a = (a.astype(jnp.int32) * sign).astype(jnp.int8)
     base = table[indices].astype(jnp.int32)
@@ -246,6 +281,30 @@ def perturbed_table_lookup(table: Array, indices: Array, key: Array, rank: int, 
         return jnp.clip(base + jnp.rint(pert).astype(jnp.int32), info.min, info.max).astype(
             table.dtype
         )
+    return table[indices] + scale * jnp.einsum("...r,cr->...c", a[indices], b)
+
+
+def perturbed_table_lookup_prepared(
+    table: Array,
+    indices: Array,
+    a: Array,
+    b: Array,
+    sigma: float,
+) -> Array:
+    """Float/integer table lookup with reusable pre-generated factors."""
+    if table.ndim != 2 or a.ndim != 2 or b.ndim != 2:
+        raise ValueError("table and prepared factors must be two-dimensional")
+    rank = int(a.shape[1])
+    if b.shape != (table.shape[1], rank) or a.shape[0] != table.shape[0]:
+        raise ValueError("prepared table factors are incompatible with table shape")
+    scale = scaled_factor(rank, sigma, table.dtype)
+    if jnp.issubdtype(table.dtype, jnp.integer):
+        base = table[indices].astype(jnp.int32)
+        pert = scale * jnp.einsum("...r,cr->...c", a[indices], b)
+        info = jnp.iinfo(table.dtype)
+        return jnp.clip(
+            base + jnp.rint(pert).astype(jnp.int32), info.min, info.max
+        ).astype(table.dtype)
     return table[indices] + scale * jnp.einsum("...r,cr->...c", a[indices], b)
 
 
