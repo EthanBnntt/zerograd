@@ -37,7 +37,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from ._cluster import ParamsBuilder, ZeroGradNode, evaluate_and_step
+from ._cluster import ParamsBuilder, ZeroGradNode, _numeric_param_leaves, evaluate_and_step
 from ._distributed import compute_partition_sizes
 from ._manifest import ParameterTree
 from ._optimizer import LossFn, StepMetrics, ZeroGrad, ZeroGradState
@@ -334,11 +334,13 @@ class FaultTolerantCluster:
         """Verify all nodes (active and paused) have identical params."""
         if len(self._statuses) < 2:
             return True
-        ref_leaves = jax.tree_util.tree_leaves(self._statuses[0].node.params)
+        ref_leaves = _numeric_param_leaves(self._statuses[0].node.params)
         for status in self._statuses[1:]:
-            node_leaves = jax.tree_util.tree_leaves(status.node.params)
+            node_leaves = _numeric_param_leaves(status.node.params)
+            if len(ref_leaves) != len(node_leaves):
+                return False
             for a, b in zip(ref_leaves, node_leaves):
-                if float(jnp.max(jnp.abs(a - b))) > atol:
+                if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
                     return False
         return True
 
@@ -346,9 +348,11 @@ class FaultTolerantCluster:
         self, params: ParameterTree, atol: float = 1e-5,
     ) -> bool:
         """Verify cluster params match an externally-computed baseline."""
-        ref_leaves = jax.tree_util.tree_leaves(params)
-        cluster_leaves = jax.tree_util.tree_leaves(self._statuses[0].node.params)
+        ref_leaves = _numeric_param_leaves(params)
+        cluster_leaves = _numeric_param_leaves(self._statuses[0].node.params)
+        if len(ref_leaves) != len(cluster_leaves):
+            return False
         for a, b in zip(ref_leaves, cluster_leaves):
-            if float(jnp.max(jnp.abs(a - b))) > atol:
+            if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
                 return False
         return True

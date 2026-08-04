@@ -129,6 +129,15 @@ class ZeroGradNode:
         return self._seed
 
 
+def _numeric_param_leaves(tree: Any) -> list[Array]:
+    """Array leaves safe to subtract for sync checks (skip PRNG keys, etc.)."""
+    leaves: list[Array] = []
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.number):
+            leaves.append(leaf)
+    return leaves
+
+
 def evaluate_and_step(
     shards: Sequence[tuple[ZeroGradNode, Array]],
     step_nodes: Sequence[ZeroGradNode],
@@ -271,10 +280,12 @@ class ClusterZeroGrad:
         """
         if len(self._nodes) < 2:
             return True
-        ref_leaves = jax.tree_util.tree_leaves(self._nodes[0].params)
+        ref_leaves = _numeric_param_leaves(self._nodes[0].params)
         for node in self._nodes[1:]:
-            node_leaves = jax.tree_util.tree_leaves(node.params)
+            node_leaves = _numeric_param_leaves(node.params)
+            if len(ref_leaves) != len(node_leaves):
+                return False
             for a, b in zip(ref_leaves, node_leaves):
-                if float(jnp.max(jnp.abs(a - b))) > atol:
+                if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
                     return False
         return True

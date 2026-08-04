@@ -621,6 +621,33 @@ class ZeroGrad:
                 f"losses must have {self._population_size} entries, got {losses.shape[0]}"
             )
 
+    def _optax_from_descent(
+        self,
+        params: ParameterTree,
+        descent: ParameterTree,
+        opt_state: Any,
+        *,
+        bits: int | None,
+        mask_integers_against: ParameterTree | None = None,
+    ) -> tuple[ParameterTree, Any]:
+        """Shared Optax update: pseudo-grad → transform → snap-to-integer."""
+        pseudo_grad = _build_pseudo_grad(descent, params)
+        if mask_integers_against is not None:
+            pseudo_grad = _mask_integer_leaves(pseudo_grad, mask_integers_against)
+            base = mask_integers_against
+        else:
+            base = params
+        float_params = float_view_tree(base)
+        updates, new_opt_state = self._transform.update(
+            pseudo_grad, opt_state, float_params
+        )
+        new_float = optax.apply_updates(float_params, updates)
+        if mask_integers_against is not None:
+            return _merge_keep_integers(base, new_float), new_opt_state
+        if bits is None:
+            return snap_tree_to_integer(new_float, params), new_opt_state
+        return snap_tree_to_integer(new_float, params, bits=bits), new_opt_state
+
     def _step_from_losses(
         self,
         state: ZeroGradState,
@@ -666,14 +693,13 @@ class ZeroGrad:
                 descent = replay_integer(
                     params, self._manifest, base_key, pair_ids, pair_weights, self._rank
                 )
-                pseudo_grad = _build_pseudo_grad(descent, params)
-                pseudo_grad = _mask_integer_leaves(pseudo_grad, new_params)
-                float_params = float_view_tree(new_params)
-                updates, new_opt_state = self._transform.update(
-                    pseudo_grad, state.opt_state, float_params
+                new_params, new_opt_state = self._optax_from_descent(
+                    params,
+                    descent,
+                    state.opt_state,
+                    bits=None,
+                    mask_integers_against=new_params,
                 )
-                new_float = optax.apply_updates(float_params, updates)
-                new_params = _merge_keep_integers(new_params, new_float)
         elif self._integer_es:
             half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
@@ -682,25 +708,16 @@ class ZeroGrad:
             descent = replay_integer(
                 params, self._manifest, base_key, pair_ids, pair_weights, self._rank
             )
-            pseudo_grad = _build_pseudo_grad(descent, params)
-            float_params = float_view_tree(params)
-            updates, new_opt_state = self._transform.update(
-                pseudo_grad, state.opt_state, float_params
+            new_params, new_opt_state = self._optax_from_descent(
+                params, descent, state.opt_state, bits=self._int_bits
             )
-            new_float = optax.apply_updates(float_params, updates)
-            new_params = snap_tree_to_integer(new_float, params, bits=self._int_bits)
         else:
             candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
             shaped = shape_centered_loss(losses, self._sigma)
             descent = replay(params, self._manifest, base_key, candidate_ids, shaped, self._rank)
-            pseudo_grad = _build_pseudo_grad(descent, params)
-
-            float_params = float_view_tree(params)
-            updates, new_opt_state = self._transform.update(
-                pseudo_grad, state.opt_state, float_params
+            new_params, new_opt_state = self._optax_from_descent(
+                params, descent, state.opt_state, bits=None
             )
-            new_float = optax.apply_updates(float_params, updates)
-            new_params = snap_tree_to_integer(new_float, params)
 
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
         if self._population_size % 2 == 0:
