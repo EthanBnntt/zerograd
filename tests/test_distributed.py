@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import optax
 import pytest
 from flax import nnx
+from zerograd._nnx import params_pure_dict
 
 from zerograd import (
     CalibrationResult,
@@ -328,6 +329,10 @@ class TestReplicatedDistributedZeroGrad:
             assert state.generation == 1
             assert metrics.population_size == 8
             assert model is distributed.model
+            assert distributed.verify_sync()
+            params = jax.tree.map(jax.device_get, params_pure_dict(model))
+            distributed.restore_params(params, generation=7)
+            assert distributed.state.generation == 7
             assert distributed.verify_sync()
 
     def test_shutdown_blocks_future_steps(self):

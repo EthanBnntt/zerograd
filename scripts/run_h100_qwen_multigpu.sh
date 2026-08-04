@@ -16,8 +16,15 @@ if [ ! -x "$PYTHON" ]; then
   PYTHON="uv run python"
 fi
 
+CHECKPOINT_OUT="${CHECKPOINT_OUT:-checkpoints/int-gdn-qwen-4gpu-latest.pkl}"
+RESUME_ARGS=()
+if [ -f "${RESUME_FROM:-$CHECKPOINT_OUT}" ]; then
+  RESUME_ARGS+=(--resume-from "${RESUME_FROM:-$CHECKPOINT_OUT}")
+fi
+
 exec $PYTHON examples/train_int_rnn_minipile_multigpu.py \
-  --steps "${STEPS:-300}" \
+  --steps "${STEPS:-1000000}" \
+  --max-hours "${MAX_HOURS:-4}" \
   --devices "${DEVICES:-4}" \
   --dim "${DIM:-384}" \
   --heads "${HEADS:-6}" \
@@ -33,9 +40,10 @@ exec $PYTHON examples/train_int_rnn_minipile_multigpu.py \
   --candidate-chunk "${CAND_CHUNK:-32}" \
   --logit-chunk "${LOGIT_CHUNK:-8192}" \
   --tokenizer-mode qwen \
-  --checkpoint-out "${CHECKPOINT_OUT:-checkpoints/int-gdn-qwen-4gpu-latest.pkl}" \
-  --checkpoint-every "${CHECKPOINT_EVERY:-25}" \
-  --log-every "${LOG_EVERY:-5}" \
+  --checkpoint-out "$CHECKPOINT_OUT" \
+  --checkpoint-every "${CHECKPOINT_EVERY:-1000}" \
+  --log-every "${LOG_EVERY:-50}" \
   --wandb-project "${WANDB_PROJECT:-zerograd-int-gdn}" \
   --wandb-run-name "${WANDB_RUN_NAME:-h100-4x-gdn2-qwen-d384-L4-pop256}" \
+  "${RESUME_ARGS[@]}" \
   "$@"

@@ -51,6 +51,13 @@ def main() -> None:
         default="checkpoints/int-gdn-char-4gpu-latest.pkl",
     )
     parser.add_argument("--checkpoint-every", type=int, default=50)
+    parser.add_argument("--resume-from", default=None)
+    parser.add_argument(
+        "--max-hours",
+        type=float,
+        default=0.0,
+        help="Strict wall-clock limit including compilation (0 disables).",
+    )
     parser.add_argument("--wandb-project", default="zerograd-int-gdn")
     parser.add_argument(
         "--wandb-run-name",
@@ -134,6 +141,8 @@ def main() -> None:
         "tokenizer": args.tokenizer,
         "tokenizer_mode": args.tokenizer_mode,
         "seed": args.seed,
+        "resume_from": args.resume_from,
+        "max_hours": args.max_hours,
     }
 
     wb = None
@@ -153,6 +162,32 @@ def main() -> None:
         model_factory=model_factory,
         loss_fn=train.loss_fn,
     )
+    if args.resume_from:
+        payload = train.read_checkpoint(args.resume_from)
+        checkpoint_config = payload["config"]
+        expected = {
+            "dim": args.dim,
+            "heads": args.heads,
+            "layers": args.layers,
+            "vocab_size": vocab_size,
+            "tokenizer_mode": args.tokenizer_mode,
+        }
+        mismatches = {
+            key: (checkpoint_config.get(key), value)
+            for key, value in expected.items()
+            if checkpoint_config.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"checkpoint configuration mismatch: {mismatches}")
+        distributed.restore_params(
+            payload["params"],
+            generation=int(payload["generation"]),
+        )
+        print(
+            f"Resumed checkpoint {args.resume_from} at generation "
+            f"{distributed.state.generation}",
+            flush=True,
+        )
     print(f"JAX devices: {devices}", flush=True)
     print(
         f"Model parameters: {train.count_params(distributed.model):,}; "
@@ -170,6 +205,11 @@ def main() -> None:
     metrics = None
     best_nll = math.inf
     started = time.perf_counter()
+    deadline = (
+        started + args.max_hours * 3600.0
+        if args.max_hours > 0
+        else math.inf
+    )
     try:
         compile_start = time.perf_counter()
         model, state, metrics = distributed.step(warm)
@@ -199,6 +239,12 @@ def main() -> None:
             )
 
         for _ in range(1, args.steps):
+            if time.perf_counter() >= deadline:
+                print(
+                    f"Reached wall-clock limit of {args.max_hours:.3f} hours",
+                    flush=True,
+                )
+                break
             batch = batcher.next_batch()
             step_start = time.perf_counter()
             model, state, metrics = distributed.step(batch)

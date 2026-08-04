@@ -840,12 +840,18 @@ def save_checkpoint(
     return target
 
 
-def load_checkpoint(model: IntRnnLM, path: str | Path) -> dict:
-    """Load a trusted checkpoint created by :func:`save_checkpoint`."""
+def read_checkpoint(path: str | Path) -> dict:
+    """Read a trusted local checkpoint payload."""
     with Path(path).expanduser().open("rb") as handle:
         payload = pickle.load(handle)  # noqa: S301 - explicitly trusted local artifact
     if payload.get("format") != "zerograd-int-rnn-v1":
         raise ValueError("unsupported integer RNN checkpoint format")
+    return payload
+
+
+def load_checkpoint(model: IntRnnLM, path: str | Path) -> dict:
+    """Load a trusted checkpoint created by :func:`save_checkpoint`."""
+    payload = read_checkpoint(path)
     params = jax.tree.map(jnp.asarray, payload["params"])
     update_params(model, params)
     disable_candidates(model)

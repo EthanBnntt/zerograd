@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._manifest import ParameterTree
-from ._nnx import params_pure_dict
+from ._nnx import params_pure_dict, update_params
 from ._optimizer import LossFn, ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
@@ -568,3 +568,21 @@ class ReplicatedDistributedZeroGrad:
                 if not np.array_equal(expected, np.asarray(jax.device_get(value))):
                     return False
         return True
+
+    def restore_params(self, params: Any, *, generation: int) -> None:
+        """Restore identical pure params on every replica (one-time checkpoint load)."""
+        if generation < 0:
+            raise ValueError("generation must be non-negative")
+        for replica in self._replicas:
+            if replica.state.opt_state is not None:
+                raise ValueError(
+                    "restore_params currently supports stateless/bin-update optimizers"
+                )
+            with jax.default_device(replica.device):
+                params_device = jax.tree.map(
+                    lambda value: jax.device_put(value, replica.device),
+                    params,
+                )
+                update_params(replica.model, params_device)
+                replica.state = ZeroGradState(generation=generation, opt_state=None)
+                jax.block_until_ready(params_pure_dict(replica.model))
