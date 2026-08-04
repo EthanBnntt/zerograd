@@ -59,6 +59,7 @@ $PYTHON examples/train_int_rnn_minipile.py \
   --delta-chunk "${DELTA_CHUNK:-64}" \
   --gdn-feat-tile "${GDN_FEAT_TILE:-32}" \
   --logit-chunk "${LOGIT_CHUNK:-12288}" \
+  --tokenizer-mode "${TOKENIZER_MODE:-qwen}" \
   --prefetch 8 \
   --log-every "${LOG_EVERY:-10}" \
   --gen-every "${GEN_EVERY:-0}" \

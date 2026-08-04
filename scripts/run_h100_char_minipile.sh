@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Diagnostic character/byte-level GDN-2 run on one H100.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+export TOKENIZER_MODE="${TOKENIZER_MODE:-byte}"
+export DIM="${DIM:-1024}"
+export HEADS="${HEADS:-8}"
+export LAYERS="${LAYERS:-4}"
+export FFN_MULT="${FFN_MULT:-4}"
+export SEQ_LEN="${SEQ_LEN:-512}"
+export BATCH="${BATCH:-32}"
+export POP="${POP:-256}"
+export RANK="${RANK:-8}"
+export SIGMA_SHIFT="${SIGMA_SHIFT:-4}"
+export UPDATE_ALPHA="${UPDATE_ALPHA:-0.02}"
+export ALPHA_DECAY="${ALPHA_DECAY:-0.001}"
+export CAND_CHUNK="${CAND_CHUNK:-32}"
+export CE_PARALLEL="${CE_PARALLEL:-1}"
+export LOGIT_CHUNK="${LOGIT_CHUNK:-512}"
+export STEPS="${STEPS:-500}"
+export LOG_EVERY="${LOG_EVERY:-5}"
+export GEN_EVERY="${GEN_EVERY:-0}"
+export WANDB="${WANDB:-1}"
+export WANDB_PROJECT="${WANDB_PROJECT:-zerograd-int-gdn}"
+export WANDB_RUN_NAME="${WANDB_RUN_NAME:-h100-gdn2-char-d1024-L4-pop256}"
+
+exec bash scripts/launch_wandb_train.sh "$@"

@@ -657,11 +657,35 @@ def lut_stats(model: IntRnnLM) -> tuple[int, float]:
         total_abs += float(jnp.mean(delta))
     return changed, total_abs / len(tables)
 
-# ── MiniPile + Qwen3.6 tokenizer → packed next-token batches ──────────────────
+# ── MiniPile tokenization → packed next-token batches ────────────────────────
 
 
-def load_tokenizer(name: str = DEFAULT_TOKENIZER):
-    """Load a HuggingFace tokenizer (default: Qwen3.6)."""
+class ByteTokenizer:
+    """Reversible UTF-8 byte/character tokenizer with one document EOS token."""
+
+    eos_token_id = 256
+    pad_token_id = 256
+    eos_token = "<|byte_eos|>"
+
+    def __len__(self) -> int:
+        return 257
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return list(text.encode("utf-8"))
+
+    def decode(self, ids, *, skip_special_tokens: bool = True) -> str:
+        del skip_special_tokens
+        data = bytes(int(token) for token in ids if 0 <= int(token) < 256)
+        return data.decode("utf-8", errors="replace")
+
+
+def load_tokenizer(name: str = DEFAULT_TOKENIZER, *, mode: str = "qwen"):
+    """Load Qwen subwords or the local 257-token UTF-8 byte vocabulary."""
+    if mode == "byte":
+        return ByteTokenizer()
+    if mode != "qwen":
+        raise ValueError(f"unknown tokenizer mode {mode!r}")
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
@@ -977,10 +1001,16 @@ def main():
         help="Host-side batch queue depth (overlaps MiniPile IO with GPU)",
     )
     parser.add_argument(
+        "--tokenizer-mode",
+        choices=("qwen", "byte"),
+        default="qwen",
+        help="qwen=subword tokenizer; byte=257-token UTF-8 character/byte vocabulary",
+    )
+    parser.add_argument(
         "--tokenizer",
         type=str,
         default=DEFAULT_TOKENIZER,
-        help="HuggingFace tokenizer id (default: Qwen3.6)",
+        help="HuggingFace tokenizer id when --tokenizer-mode=qwen",
     )
     parser.add_argument(
         "--gen-every",
@@ -1070,8 +1100,13 @@ def main():
         flush=True,
     )
 
-    print(f"Loading tokenizer {args.tokenizer!r} ...", flush=True)
-    tokenizer = load_tokenizer(args.tokenizer)
+    tokenizer_label = (
+        "UTF-8 byte/character vocabulary"
+        if args.tokenizer_mode == "byte"
+        else repr(args.tokenizer)
+    )
+    print(f"Loading tokenizer {tokenizer_label} ...", flush=True)
+    tokenizer = load_tokenizer(args.tokenizer, mode=args.tokenizer_mode)
     vocab_size = len(tokenizer)
     chance_nll = math.log(vocab_size)
     chance_ppl = float(vocab_size)
@@ -1200,6 +1235,7 @@ def main():
                 "vocab_size": vocab_size,
                 "params": n_params,
                 "tokenizer": args.tokenizer,
+                "tokenizer_mode": args.tokenizer_mode,
                 "device": str(jax.devices()[0]),
             },
         )
