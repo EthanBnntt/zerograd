@@ -429,31 +429,73 @@ class ZeroGrad:
             rng = jax.random.key(0)
         assert self._manifest is not None
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
-        graphdef, state = nnx.split(model)
+        graphdef, model_state = nnx.split(model)
         pop = self._population_size
         accepts_rng = _model_loss_accepts_rng(loss_fn)
 
-        def evaluate_candidate(candidate_id: Array) -> Array:
-            if self._integer_es:
-                pair = antithetical_pair_id(candidate_id, pop)
-                sign = antithetical_sign(candidate_id, pop)
-                ck = candidate_key(base_key, pair)
-            else:
-                ck = candidate_key(base_key, candidate_id)
-                sign = 1
-            candidate_rng = jax.random.fold_in(rng, candidate_id)
-            bound = bind_candidate(graphdef, state, ck, enabled=True, factor_sign=sign)
-            loss, _aux = _call_model_loss(
-                loss_fn,
-                bound,
-                batch,
-                candidate_rng,
-                accepts_rng=accepts_rng,
-            )
-            return loss
+        # Cache one JIT boundary around the complete candidate shard. Without
+        # this, every replica retraces and dispatches the NNX model piecemeal on
+        # every generation, making Python/GIL overhead dominate multi-GPU runs.
+        if not hasattr(self, "_nnx_eval_jit_cache"):
+            self._nnx_eval_jit_cache: dict = {}
+        cache_key = (
+            id(loss_fn),
+            _tree_sig(model_state),
+            _tree_sig(batch),
+            tuple(candidate_ids.shape),
+            str(candidate_ids.dtype),
+            self._candidate_chunk_size,
+        )
+        evaluate_shard_jit = self._nnx_eval_jit_cache.get(cache_key)
+        if evaluate_shard_jit is None:
 
-        return _map_candidates(
-            evaluate_candidate, candidate_ids, chunk_size=self._candidate_chunk_size
+            def evaluate_shard_program(
+                state_p,
+                batch_p,
+                candidate_ids_p,
+                rng_p,
+                base_key_p,
+            ):
+                def evaluate_candidate(candidate_id: Array) -> Array:
+                    if self._integer_es:
+                        pair = antithetical_pair_id(candidate_id, pop)
+                        sign = antithetical_sign(candidate_id, pop)
+                        ck = candidate_key(base_key_p, pair)
+                    else:
+                        ck = candidate_key(base_key_p, candidate_id)
+                        sign = 1
+                    candidate_rng = jax.random.fold_in(rng_p, candidate_id)
+                    bound = bind_candidate(
+                        graphdef,
+                        state_p,
+                        ck,
+                        enabled=True,
+                        factor_sign=sign,
+                    )
+                    loss, _aux = _call_model_loss(
+                        loss_fn,
+                        bound,
+                        batch_p,
+                        candidate_rng,
+                        accepts_rng=accepts_rng,
+                    )
+                    return loss
+
+                return _map_candidates(
+                    evaluate_candidate,
+                    candidate_ids_p,
+                    chunk_size=self._candidate_chunk_size,
+                )
+
+            evaluate_shard_jit = jax.jit(evaluate_shard_program)
+            self._nnx_eval_jit_cache[cache_key] = evaluate_shard_jit
+
+        return evaluate_shard_jit(
+            model_state,
+            batch,
+            candidate_ids,
+            rng,
+            base_key,
         )
 
     def _jit_update_bin_params(self, params: ParameterTree, thresholds: ParameterTree):
