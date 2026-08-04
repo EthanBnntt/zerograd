@@ -454,68 +454,6 @@ class ZeroGrad:
             evaluate_candidate, candidate_ids, chunk_size=self._candidate_chunk_size
         )
 
-    def _evaluate_antithetical_nnx(
-        self,
-        model: nnx.Module,
-        generation: int,
-        loss_fn: ModelLossFn,
-        batch: Any,
-        *,
-        rng: Array,
-    ) -> Array:
-        """Evaluate the full integer-ES population as dense ``[pair, sign]`` batches.
-
-        The perturbation key depends on ``pair`` while only ``factor_sign`` and
-        the model activations vary across the inner sign axis.  Nesting the sign
-        vmap lets JAX hoist factor generation out of that axis, so antithetical
-        candidates share their A/B factors instead of regenerating identical
-        random tensors twice.
-        """
-        assert self._manifest is not None
-        pop = self._population_size
-        half = pop // 2
-        base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
-        graphdef, model_state = nnx.split(model)
-        accepts_rng = _model_loss_accepts_rng(loss_fn)
-        signs = jnp.asarray((1, -1), dtype=jnp.int32)
-        sign_offsets = jnp.asarray((0, half), dtype=jnp.int32)
-
-        def evaluate_pair(pair_id: Array) -> Array:
-            ck = candidate_key(base_key, pair_id)
-
-            def evaluate_sign(sign_and_offset: tuple[Array, Array]) -> Array:
-                sign, offset = sign_and_offset
-                candidate_id = pair_id + offset
-                candidate_rng = jax.random.fold_in(rng, candidate_id)
-                bound = bind_candidate(
-                    graphdef, model_state, ck, enabled=True, factor_sign=sign
-                )
-                loss, _aux = _call_model_loss(
-                    loss_fn,
-                    bound,
-                    batch,
-                    candidate_rng,
-                    accepts_rng=accepts_rng,
-                )
-                return loss
-
-            return jax.vmap(evaluate_sign)((signs, sign_offsets))
-
-        # candidate_chunk_size is expressed in candidates; one pair contributes
-        # two candidates to the inner dense sign axis.
-        pair_chunk = (
-            None
-            if self._candidate_chunk_size is None
-            else max(1, self._candidate_chunk_size // 2)
-        )
-        pair_losses = _map_candidates(
-            evaluate_pair,
-            jnp.arange(half, dtype=jnp.int32),
-            chunk_size=pair_chunk,
-        )
-        # Preserve the public ordering: all + candidates, then all - candidates.
-        return jnp.concatenate((pair_losses[:, 0], pair_losses[:, 1]), axis=0)
-
     def _jit_update_bin_params(self, params: ParameterTree, thresholds: ParameterTree):
         """JIT the bin-update path once per params shape (cached on the instance).
 
@@ -726,14 +664,13 @@ class ZeroGrad:
 
         if isinstance(model_or_params, nnx.Module):
             model = model_or_params
-            if self._integer_es:
-                losses = self._evaluate_antithetical_nnx(
-                    model, generation, loss_fn, batch, rng=rng
-                )
-            else:
-                losses = self._evaluate_shard_nnx(
-                    model, generation, loss_fn, batch, candidate_ids, rng=rng
-                )
+            # Candidates are independent: one flat vmap gives XLA a single
+            # dense population axis. A nested [pair, sign] vmap shared PRNG
+            # factors but measured slower on H100 due to less favorable kernel
+            # shapes, so antithetical IDs stay in this flat batch.
+            losses = self._evaluate_shard_nnx(
+                model, generation, loss_fn, batch, candidate_ids, rng=rng
+            )
             return self.step_from_losses(state, model, losses)
 
         assert self._manifest is not None

@@ -83,7 +83,9 @@ def main() -> None:
         int_bits=8,
         update_alpha=0.12,
         alpha_decay=0.0,
-        candidate_chunk_size=args.candidate_chunk,
+        candidate_chunk_size=(
+            None if args.candidate_chunk == 0 else args.candidate_chunk
+        ),
         check_finite=False,
     )
     state = optimizer.init(model)
@@ -114,20 +116,13 @@ def main() -> None:
     candidate_ids = jnp.arange(args.population, dtype=jnp.int32)
 
     def evaluate() -> jax.Array:
-        if optimizer.integer_es:
-            return optimizer._evaluate_antithetical_nnx(  # noqa: SLF001
-                model,
-                state.generation,
-                loss_fn,
-                batch,
-                rng=jax.random.key(0),
-            )
-        return optimizer.evaluate_shard(
+        return optimizer._evaluate_shard_nnx(  # noqa: SLF001
             model,
             state.generation,
             loss_fn,
             batch,
             candidate_ids,
+            rng=jax.random.key(0),
         )
 
     def update(losses):
