@@ -90,6 +90,7 @@ def test_scanned_int_gdn_runs_one_integer_es_step():
     assert state.generation == 1
     assert jnp.isfinite(metrics.mean_loss)
     assert model.encode(tokens).shape == (2, 8, 32)
+    assert model.last_logits(tokens, chunk_size=16).shape == (2, 64)
     assert all(
         jnp.issubdtype(leaf.dtype, jnp.integer)
         for leaf in jax.tree.leaves(train.params_pure_dict(model))

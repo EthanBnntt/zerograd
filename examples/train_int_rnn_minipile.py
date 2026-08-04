@@ -556,15 +556,23 @@ class IntRnnLM(nnx.Module):
         embed_factors = self._prepare_embed_factors()
         h = self.encode(tokens, embed_factors=embed_factors)[:, -1:, :]  # [B, 1, D]
         v = self.vocab_size
-        parts: list[jax.Array] = []
-        for start in range(0, v, chunk_size):
-            size = min(chunk_size, v - start)
-            parts.append(
-                self._logits_chunk(
-                    h, start, size, embed_factors=embed_factors
-                )[:, 0, :]
-            )
-        return jnp.concatenate(parts, axis=-1)
+        n_chunks = (v + chunk_size - 1) // chunk_size
+
+        def one_chunk(chunk_id):
+            return self._logits_chunk(
+                h,
+                chunk_id * chunk_size,
+                chunk_size,
+                embed_factors=embed_factors,
+            )[:, 0, :]
+
+        # Vocabulary chunks are independent; map them in one compiled program
+        # and trim the padded tail rather than Python-looping over launches.
+        parts = jax.lax.map(
+            one_chunk,
+            jnp.arange(n_chunks, dtype=jnp.int32),
+        )
+        return parts.transpose(1, 0, 2).reshape(h.shape[0], -1)[:, :v]
 
     def chunked_nll(
         self,
