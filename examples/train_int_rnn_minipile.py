@@ -30,10 +30,11 @@ H100 efficiency notes:
       --steps 2000 --dim 512 --heads 8 --layers 6 --seq-len 256 \\
       --batch 8 --population 16 --candidate-chunk 4 \\
       --delta-impl chunkwise --delta-chunk 64 --logit-chunk 8192
-    # H100 80GB — one vmap over the complete population (~51GB measured peak).
+    # H100 80GB — 128 antithetical directions in dense candidate chunks.
     uv run python examples/train_int_rnn_minipile.py \\
       --steps 2000 --dim 2048 --heads 16 --layers 12 --seq-len 512 --ffn-mult 4 \\
-      --batch 16 --population 32 --candidate-chunk 0 --ce-parallel 2 --rank 4 \\
+      --batch 16 --population 256 --candidate-chunk 32 --ce-parallel 2 --rank 4 \\
+      --sigma-shift 3 --update-alpha 0.02 --alpha-decay 0.001 \\
       --delta-impl chunkwise --delta-chunk 64 --logit-chunk 12288 --gdn-feat-tile 32
 """
 
@@ -75,8 +76,10 @@ SEQ_LEN = 128
 BITS = 8
 # Q8 scale: gates / products use / 127 (≈ float gate in [0, 1]).
 Q8 = 127
-# Tied-embed attend already applies egg ``// (16√D)``; divide again for CE scale.
-LOGIT_SCALE = float(egg_matmul_divisor(EMBED_DIM))
+# Tied-embed attend applies ``// (16√D)`` once. The resulting integer logits
+# live on the Q8 activation scale, so divide by 127 rather than repeating the
+# width normalization (which made the softmax nearly uniform).
+LOGIT_SCALE = float(Q8)
 EGG_DIV = egg_matmul_divisor(EMBED_DIM)
 # Paper default chunk length for WY intra-chunk parallel (scan only across chunks).
 DELTA_CHUNK = 64
@@ -122,7 +125,7 @@ def configure_architecture(
     FFN_MULT = int(ffn_mult)
     FFN_DIM = EMBED_DIM * FFN_MULT
     SEQ_LEN = int(seq_len)
-    LOGIT_SCALE = float(egg_matmul_divisor(EMBED_DIM))
+    LOGIT_SCALE = float(Q8)
     EGG_DIV = egg_matmul_divisor(EMBED_DIM)
 
 
@@ -913,7 +916,8 @@ def main():
         "--population",
         type=int,
         default=16,
-        help="ES population (even). Keep modest; widen --dim for util instead.",
+        help="ES population (even). Large models need many antithetical directions; "
+        "use --candidate-chunk to bound VRAM.",
     )
     parser.add_argument("--rank", type=int, default=2)
     parser.add_argument("--sigma-shift", type=int, default=2)
@@ -1097,7 +1101,9 @@ def main():
         seq_len=SEQ_LEN,
     )
     batcher = PrefetchBatcher(raw_batcher, depth=args.prefetch)
-    # Prefetch one batch so the HF handshake finishes before compile.
+    # Hold out one fixed batch so eval trends are not hidden by batch-to-batch
+    # MiniPile variance. The next batch is used for compile/warmup training.
+    validation = batcher.next_batch()
     warm = batcher.next_batch()
     print(
         f"  first batch tokens={warm[0].shape}  "
@@ -1204,7 +1210,7 @@ def main():
     jax.block_until_ready(metrics.mean_loss)
     if not bool(jnp.isfinite(metrics.mean_loss)):
         raise FloatingPointError("non-finite candidate loss during warmup")
-    warm_nll, warm_ppl = nll_and_ppl(model, warm[0], warm[1])
+    warm_nll, warm_ppl = nll_and_ppl(model, validation[0], validation[1])
     jax.block_until_ready(warm_nll)
     compile_s = time.time() - t0
     print(
@@ -1219,6 +1225,8 @@ def main():
             {
                 "compile_s": compile_s,
                 "train/loss": float(metrics.mean_loss),
+                "train/loss_std": float(metrics.std_loss),
+                "train/pair_margin": float(metrics.mean_pair_margin),
                 "eval/nll": float(warm_nll),
                 "eval/ppl": float(warm_ppl),
                 "eval/best_nll": float(warm_nll),
@@ -1259,7 +1267,7 @@ def main():
             gen = int(metrics.generation)
 
             if should_log:
-                nll, ppl = nll_and_ppl(model, batch[0], batch[1])
+                nll, ppl = nll_and_ppl(model, validation[0], validation[1])
                 jax.block_until_ready(nll)
                 nll_f, ppl_f = float(nll), float(ppl)
                 best_nll = min(best_nll, nll_f)
@@ -1268,6 +1276,8 @@ def main():
                 rec = {
                     "step": step,
                     "train_loss": float(metrics.mean_loss),
+                    "loss_std": float(metrics.std_loss),
+                    "pair_margin": float(metrics.mean_pair_margin),
                     "nll": nll_f,
                     "ppl": ppl_f,
                     "lut_changed": n_lut,
@@ -1279,6 +1289,7 @@ def main():
                 print(
                     f"  gen {gen:5d}/{args.steps}  "
                     f"train={metrics.mean_loss:.4f}  "
+                    f"pairΔ={metrics.mean_pair_margin:.5f}  "
                     f"nll={nll_f:.4f}  ppl={ppl_f:.2f}  "
                     f"best_nll={best_nll:.4f}  "
                     f"lutΔ={n_lut}  "
@@ -1290,6 +1301,8 @@ def main():
                     wb.log(
                         {
                             "train/loss": float(metrics.mean_loss),
+                            "train/loss_std": float(metrics.std_loss),
+                            "train/pair_margin": float(metrics.mean_pair_margin),
                             "eval/nll": nll_f,
                             "eval/ppl": ppl_f,
                             "eval/best_nll": best_nll,

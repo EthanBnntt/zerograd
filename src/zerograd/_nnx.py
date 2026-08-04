@@ -954,8 +954,8 @@ class IntAffine(nnx.Module):
 
     ``y = ((x - mean(x)) * scale) >> shift + bias`` with int16 scale, int activation bias.
 
-    With ``egg=True``: scale init 16 (Appendix G.3 ``θln``), shift 0, clip to ±127
-    so saturation remains the nonlinearity.
+    With ``egg=True``: scale init 16 (Appendix G.3 ``θln``) in Q4 fixed point,
+    shift 4, then clip to ±127.
     """
 
     def __init__(
@@ -974,7 +974,10 @@ class IntAffine(nnx.Module):
             from ._integer import EGG_I8_MAX, EGG_I8_MIN
 
             self.scale = nnx.Param(jnp.full((dim,), 16, dtype=jnp.int16))
-            self.shift = 0
+            # Appendix-G scale parameters use Q4 fixed point: 16 represents
+            # 1.0.  Shifting by zero amplified every centered activation 16×
+            # and saturated >90% of deep-model hidden states.
+            self.shift = 4
             self._qmin, self._qmax = EGG_I8_MIN, EGG_I8_MAX
             storage = jnp.int8
         else:

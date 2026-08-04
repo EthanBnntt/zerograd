@@ -5,7 +5,9 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 
+from zerograd import IntAffine
 from zerograd._integer import (
     EGG_I8_MAX,
     EGG_I8_MIN,
@@ -43,3 +45,9 @@ class TestEggInteger:
         assert w.dtype == jnp.int8
         assert int(w.min()) >= EGG_I8_MIN
         assert int(w.max()) <= EGG_I8_MAX
+
+    def test_egg_affine_q4_scale_is_not_16x_amplified(self):
+        affine = IntAffine(4, egg=True, rngs=nnx.Rngs(0))
+        x = jnp.asarray([[-12, -4, 4, 12]], dtype=jnp.int8)
+        # Mean is zero and Q4 scale 16 represents identity.
+        np.testing.assert_array_equal(np.asarray(affine(x)), np.asarray(x))

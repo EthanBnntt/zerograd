@@ -68,6 +68,8 @@ class StepMetrics:
     mean_loss: Array
     min_loss: Array
     max_loss: Array
+    std_loss: Array
+    mean_pair_margin: Array
     population_size: int
 
 
@@ -644,11 +646,18 @@ class ZeroGrad:
             new_params = snap_tree_to_integer(new_float, params)
 
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
+        if self._population_size % 2 == 0:
+            half = self._population_size // 2
+            pair_margin = jnp.mean(jnp.abs(losses[:half] - losses[half:]))
+        else:
+            pair_margin = jnp.asarray(jnp.nan, dtype=losses.dtype)
         metrics = StepMetrics(
             generation=generation,
             mean_loss=jnp.mean(losses),
             min_loss=jnp.min(losses),
             max_loss=jnp.max(losses),
+            std_loss=jnp.std(losses),
+            mean_pair_margin=pair_margin,
             population_size=self._population_size,
         )
         return new_params, new_state, metrics

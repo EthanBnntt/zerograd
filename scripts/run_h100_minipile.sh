@@ -4,9 +4,9 @@
 # Tuned for INT8 Tensor Core occupancy within ~80GB:
 #   - fused D→6D mixer in-proj + wide body (--dim)
 #   - dense factorized WY (no [C,C,hd] ratios)
-#   - full-population vmap: ~51GB measured peak for B=16/P=32
-#   - modest --ce-parallel because the population axis already fills the GPU
-#   - --rank 4 fattens ES factor GEMMs vs default rank-2
+#   - population 256 (128 antithetical directions), evaluated in dense chunks
+#     of 32 (~51GB measured peak per chunk)
+#   - conservative local perturbations and 2% decaying bin updates
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -48,9 +48,12 @@ $PYTHON examples/train_int_rnn_minipile.py \
   --ffn-mult "${FFN_MULT:-4}" \
   --seq-len "${SEQ_LEN:-512}" \
   --batch "${BATCH:-16}" \
-  --population "${POP:-32}" \
+  --population "${POP:-256}" \
   --rank "${RANK:-4}" \
-  --candidate-chunk "${CAND_CHUNK:-0}" \
+  --sigma-shift "${SIGMA_SHIFT:-3}" \
+  --update-alpha "${UPDATE_ALPHA:-0.02}" \
+  --alpha-decay "${ALPHA_DECAY:-0.001}" \
+  --candidate-chunk "${CAND_CHUNK:-32}" \
   --ce-parallel "${CE_PARALLEL:-2}" \
   --delta-impl chunkwise \
   --delta-chunk "${DELTA_CHUNK:-64}" \
