@@ -30,11 +30,10 @@ H100 efficiency notes:
       --steps 2000 --dim 512 --heads 8 --layers 6 --seq-len 256 \\
       --batch 8 --population 16 --candidate-chunk 4 \\
       --delta-impl chunkwise --delta-chunk 64 --logit-chunk 8192
-    # H100 80GB — fused int8 in-proj + memory-light WY; keep CE tiles modest so
-    # VRAM goes to larger candidate chunks (concurrent IU8 GEMMs), not float logits.
+    # H100 80GB — one vmap over the complete population (~51GB measured peak).
     uv run python examples/train_int_rnn_minipile.py \\
       --steps 2000 --dim 2048 --heads 16 --layers 12 --seq-len 512 --ffn-mult 4 \\
-      --batch 16 --population 32 --candidate-chunk 12 --ce-parallel 2 --rank 4 \\
+      --batch 16 --population 32 --candidate-chunk 0 --ce-parallel 2 --rank 4 \\
       --delta-impl chunkwise --delta-chunk 64 --logit-chunk 12288 --gdn-feat-tile 32
 """
 
@@ -924,7 +923,7 @@ def main():
         type=int,
         default=4,
         help="Candidates per lax.map batch. 0 = vmap entire population "
-        "(high VRAM). Prefer 4–8 with wide body on 16GB.",
+        "(highest throughput; ~51GB at the H100 defaults).",
     )
     parser.add_argument(
         "--logit-chunk",
