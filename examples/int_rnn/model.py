@@ -123,7 +123,6 @@ def _linear_lut(in_features: int, out_features: int, *, rngs: nnx.Rngs) -> IntLi
         in_features,
         out_features,
         use_bias=False,
-        bits=BITS,
         lut_init="identity",
         explore_shift=0,
         rngs=rngs,
@@ -357,7 +356,6 @@ class MultiHeadGatedDelta2Mixer(nnx.Module):
             EMBED_DIM,
             6 * EMBED_DIM,
             use_bias=False,
-            bits=BITS,
             act_dtype=jnp.int8,
             rngs=rngs,
         )
@@ -420,9 +418,9 @@ class IntDeltaBlock(nnx.Module):
     """One pre-norm DeltaNet-2 block: mixer residual + MLP residual."""
 
     def __init__(self, *, rngs: nnx.Rngs, delta_impl: str = "chunkwise"):
-        self.n1 = IntAffine(EMBED_DIM, bits=BITS, rngs=rngs)
+        self.n1 = IntAffine(EMBED_DIM, rngs=rngs)
         self.mixer = MultiHeadGatedDelta2Mixer(rngs=rngs, impl=delta_impl)
-        self.n2 = IntAffine(EMBED_DIM, bits=BITS, rngs=rngs)
+        self.n2 = IntAffine(EMBED_DIM, rngs=rngs)
         self.mlp = Int8Mlp(rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -476,7 +474,7 @@ class IntRnnLM(nnx.Module):
         # ``_scan_delta_layer``. This avoids Python-unrolling twelve copies of
         # the block into the candidate executable.
         self.layers = create_layer(rngs)
-        self.norm_f = IntAffine(EMBED_DIM, bits=BITS, rngs=rngs)
+        self.norm_f = IntAffine(EMBED_DIM, rngs=rngs)
 
     def _prepare_embed_factors(self) -> tuple[jax.Array, jax.Array] | None:
         prepare = getattr(self.embed, "candidate_factors", None)

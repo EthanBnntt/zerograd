@@ -27,10 +27,9 @@ from zerograd._nnx import params_pure_dict
 class IntMLP(nnx.Module):
     """Small pure-int MLP for synthetic tasks."""
 
-    def __init__(self, din: int, hidden: int, dout: int, *, rngs: nnx.Rngs, bits: int = 8):
-        self.bits = bits
-        self.l1 = IntLinear(din, hidden, bits=bits, rngs=rngs)
-        self.l2 = IntLinear(hidden, dout, bits=bits, act_dtype=jnp.int32, rngs=rngs)
+    def __init__(self, din: int, hidden: int, dout: int, *, rngs: nnx.Rngs):
+        self.l1 = IntLinear(din, hidden, rngs=rngs)
+        self.l2 = IntLinear(hidden, dout, act_dtype=jnp.int32, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         from zerograd._integer import int_relu
