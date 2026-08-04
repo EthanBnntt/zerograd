@@ -1,15 +1,55 @@
 """JAX + Optax primitives for zero-gradient evolutionary optimization."""
 
-from ._candidate import CandidateContext, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
-from ._cluster import ClusterZeroGrad, ZeroGradNode
+from ._candidate import CandidateContext, perturbed_int_linear, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
+from ._cluster import ClusterZeroGrad, ModelBuilder, ZeroGradNode
 from ._distributed import CalibrationResult, DeviceShard, DistributedZeroGrad, ShardResult, compute_partition_sizes
 from ._fault_tolerant import FaultTolerantCluster, NodeStatus
 from ._factors import matrix_factors, scaled_factor, table_factors, vector_noise
 from ._fitness import shape_centered_loss, validate_losses
 from ._keys import candidate_key, group_key, step_key
 from ._manifest import Manifest, ManifestEntry, ParameterLayout, ParameterPath, ParameterTree
-from ._optimizer import StepMetrics, ZeroGrad, ZeroGradState
-from ._replay import replay, replay_entry
+from ._integer import (
+    egg_clip_cast,
+    egg_init_matrix,
+    egg_requantize,
+    float_to_egg_i8,
+    float_to_int,
+    int_avg_pool2d,
+    int_conv2d,
+    int_conv2d_flat,
+    int_matmul,
+)
+from ._nnx import (
+    IntAffine,
+    IntConv,
+    IntLinear,
+    IntLinearLUT,
+    IntLUT,
+    IntSpatialProj,
+    TernaryLinear,
+    ZgConv,
+    ZgEmbed,
+    ZgIntConv,
+    ZgIntLinear,
+    ZgIntLUT,
+    ZgIntSpatialProj,
+    ZgLayerNorm,
+    ZgLinear,
+    ZgTable,
+    ZgTernaryLinear,
+    ZgVector,
+    ZeroGradSlot,
+    apply_surgery,
+    mark_table,
+)
+from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
+from ._replay import replay, replay_entry, replay_integer
+from ._eggroll_h import (
+    apply_bin_updates,
+    bin_update_threshold,
+    shape_antithetical_loss,
+    threshold_tree_for_manifest,
+)
 
 __all__ = [
     "CandidateContext",
@@ -18,28 +58,66 @@ __all__ = [
     "DeviceShard",
     "DistributedZeroGrad",
     "FaultTolerantCluster",
+    "IntAffine",
+    "IntConv",
+    "IntLinear",
+    "IntLinearLUT",
+    "IntLUT",
+    "IntSpatialProj",
     "Manifest",
     "ManifestEntry",
+    "ModelBuilder",
+    "ModelLossFn",
     "NodeStatus",
     "ParameterLayout",
     "ParameterPath",
     "ParameterTree",
     "ShardResult",
     "StepMetrics",
+    "TernaryLinear",
+    "ZgConv",
+    "ZgEmbed",
+    "ZgIntConv",
+    "ZgIntLinear",
+    "ZgIntLUT",
+    "ZgIntSpatialProj",
+    "ZgLayerNorm",
+    "ZgLinear",
+    "ZgTable",
+    "ZgTernaryLinear",
+    "ZgVector",
     "ZeroGrad",
     "ZeroGradNode",
+    "ZeroGradSlot",
     "ZeroGradState",
+    "apply_bin_updates",
+    "apply_surgery",
+    "bin_update_threshold",
+    "threshold_tree_for_manifest",
     "candidate_key",
     "compute_partition_sizes",
+    "egg_clip_cast",
+    "egg_init_matrix",
+    "egg_requantize",
+    "float_to_egg_i8",
+    "float_to_int",
     "group_key",
+    "int_avg_pool2d",
+    "int_conv2d",
+    "int_conv2d_flat",
+    "int_matmul",
+    "mark_table",
     "matrix_factors",
+    "perturbed_int_linear",
     "perturbed_linear",
     "perturbed_table_lookup",
     "perturbed_tied_logits",
     "perturbed_vector",
     "replay",
     "replay_entry",
+    "replay_integer",
     "scaled_factor",
+    "shape_antithetical_loss",
     "shape_centered_loss",
     "step_key",
     "table_factors",
