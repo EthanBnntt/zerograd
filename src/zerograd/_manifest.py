@@ -119,8 +119,16 @@ class Manifest:
         for entry in self.entries:
             parameter = self.resolve(params, entry.path)
             expected_ndim = 1 if entry.layout is ParameterLayout.VECTOR else 2
-            if parameter.ndim != expected_ndim:
+            # A leading layer axis is supported for scanned modules:
+            # VECTOR [layers, size], MATRIX [layers, in, out].
+            valid_ndims = (
+                (expected_ndim,)
+                if entry.layout is ParameterLayout.TABLE
+                else (expected_ndim, expected_ndim + 1)
+            )
+            if parameter.ndim not in valid_ndims:
                 raise ValueError(
                     f"{entry.layout.value} parameter {'.'.join(entry.path)} must be "
-                    f"{expected_ndim}-D, got shape {parameter.shape}"
+                    f"{expected_ndim}-D or layer-stacked {expected_ndim + 1}-D, "
+                    f"got shape {parameter.shape}"
                 )

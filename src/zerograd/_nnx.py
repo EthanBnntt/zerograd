@@ -105,11 +105,29 @@ class ZeroGradSlot(nnx.Module):
         self.manifest: Manifest | None = None
 
 
-def _factor_key(slot: ZeroGradSlot, group: str) -> Array:
+class LayerIndex(nnx.Variable):
+    """Leading layer index scanned alongside stacked module parameters."""
+
+
+def _factor_key(
+    slot: ZeroGradSlot,
+    group: str,
+    layer_index: LayerIndex | None = None,
+) -> Array:
     manifest = slot.manifest
     if manifest is None:
         raise RuntimeError("ZeroGradSlot.manifest is not set; call ZeroGrad.init first")
-    return group_key(slot.key[...], manifest, group)
+    key = group_key(slot.key[...], manifest, group)
+    if layer_index is not None:
+        key = jax.random.fold_in(key, layer_index[...])
+    return key
+
+
+def _stacked_layer_index(value: Array, base_ndim: int) -> LayerIndex | None:
+    """Return ``[0..layers)`` when ``value`` has one leading scan dimension."""
+    if value.ndim == base_ndim + 1:
+        return LayerIndex(jnp.arange(value.shape[0], dtype=jnp.int32))
+    return None
 
 
 class ZgLinear(nnx.Module):
@@ -571,6 +589,7 @@ class ZgIntLUT(nnx.Module):
         self.explore_shift = int(lut.explore_shift)
         self.slot = slot
         self.group = group
+        self.layer_index = _stacked_layer_index(lut.table[...], 1)
 
     def __call__(self, x: Array) -> Array:
         lut = self.table[...]
@@ -578,7 +597,7 @@ class ZgIntLUT(nnx.Module):
         if slot.enabled:
             lut = perturbed_int_vector(
                 lut,
-                _factor_key(slot, self.group),
+                _factor_key(slot, self.group, self.layer_index),
                 self.explore_shift,
                 factor_sign=slot.factor_sign[...],
             )
@@ -672,6 +691,7 @@ class ZgIntConv(nnx.Module):
         self.slot = slot
         self.kernel_group = kernel_group
         self.bias_group = bias_group
+        self.layer_index = _stacked_layer_index(conv.kernel[...], 2)
 
     def __call__(self, x: Array) -> Array:
         slot = self.slot
@@ -681,7 +701,7 @@ class ZgIntConv(nnx.Module):
             y = perturbed_int_conv(
                 x,
                 kernel,
-                _factor_key(slot, self.kernel_group),
+                _factor_key(slot, self.kernel_group, self.layer_index),
                 slot.rank,
                 slot.sigma_shift,
                 kernel_hw=self.kernel_hw,
@@ -735,6 +755,7 @@ class ZgIntLinear(nnx.Module):
         self.slot = slot
         self.kernel_group = kernel_group
         self.bias_group = bias_group
+        self.layer_index = _stacked_layer_index(linear.kernel[...], 2)
 
     def __call__(self, x: Array) -> Array:
         slot = self.slot
@@ -743,7 +764,7 @@ class ZgIntLinear(nnx.Module):
             y = perturbed_int_linear(
                 x,
                 kernel,
-                _factor_key(slot, self.kernel_group),
+                _factor_key(slot, self.kernel_group, self.layer_index),
                 slot.rank,
                 slot.sigma_shift,
                 factor_sign=slot.factor_sign[...],
@@ -758,14 +779,14 @@ class ZgIntLinear(nnx.Module):
                 if jnp.issubdtype(bias.dtype, jnp.integer):
                     bias = perturbed_int_vector(
                         bias,
-                        _factor_key(slot, self.bias_group),
+                        _factor_key(slot, self.bias_group, self.layer_index),
                         slot.sigma_shift,
                         factor_sign=slot.factor_sign[...],
                     )
                 else:
                     bias = perturbed_vector(
                         bias,
-                        _factor_key(slot, self.bias_group),
+                        _factor_key(slot, self.bias_group, self.layer_index),
                         slot.sigma,
                         factor_sign=slot.factor_sign[...],
                     )
@@ -947,6 +968,9 @@ class IntAffine(nnx.Module):
             self._qmin, self._qmax = qmin, qmax
             storage = jnp.int8 if bits <= 8 else jnp.int16
         self.bias = nnx.Param(jnp.zeros((dim,), dtype=storage))
+        # Preserve vector semantics after nnx.vmap adds a leading layer axis.
+        self.scale.set_metadata(**{LAYOUT_METADATA_KEY: ParameterLayout.VECTOR.value})
+        self.bias.set_metadata(**{LAYOUT_METADATA_KEY: ParameterLayout.VECTOR.value})
 
     def __call__(self, x: Array) -> Array:
         from ._integer import int_mean
@@ -1127,6 +1151,7 @@ class ZgVector(nnx.Module):
         self.param = param
         self.slot = slot
         self.group = group
+        self.layer_index = _stacked_layer_index(param[...], 1)
 
     def _read(self) -> Array:
         value = self.param[...]
@@ -1137,13 +1162,13 @@ class ZgVector(nnx.Module):
             if jnp.issubdtype(value.dtype, jnp.integer):
                 return perturbed_int_vector(
                     value,
-                    _factor_key(slot, self.group),
+                    _factor_key(slot, self.group, self.layer_index),
                     slot.sigma_shift,
                     factor_sign=slot.factor_sign[...],
                 )
             return perturbed_vector(
                 value,
-                _factor_key(slot, self.group),
+                _factor_key(slot, self.group, self.layer_index),
                 slot.sigma,
                 factor_sign=slot.factor_sign[...],
             )
@@ -1490,6 +1515,12 @@ def bind_candidate(
                 variable = variable.replace(candidate_key_val)
             elif path[-1] == "factor_sign":
                 variable = variable.replace(sign)
+            else:
+                variable = variable.copy()
+        else:
+            # A fresh Variable wrapper is required when a candidate body nests
+            # another NNX transform (the layer scan); array storage stays shared.
+            variable = variable.copy()
         flat_state.append((path, variable))
     bound_state = type(state).from_flat_path(flat_state)
     model = nnx.merge(graphdef, bound_state)

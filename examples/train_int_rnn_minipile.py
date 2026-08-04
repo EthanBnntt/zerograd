@@ -62,7 +62,7 @@ from zerograd import (
     egg_clip_cast,
 )
 from zerograd._integer import egg_init_matrix, egg_matmul_divisor, int_matmul
-from zerograd._nnx import disable_candidates, params_pure_dict
+from zerograd._nnx import LayerIndex, disable_candidates, params_pure_dict
 
 # ── Architecture defaults (overridden by CLI via ``configure_architecture``) ─
 DEFAULT_TOKENIZER = "Qwen/Qwen3.6-27B"
@@ -445,6 +445,26 @@ class IntDeltaBlock(nnx.Module):
         return _egg_add(x, self.mlp(self.n2(x)))
 
 
+_LAYER_SCAN_AXES = nnx.StateAxes(
+    (
+        (nnx.Param, 0),
+        (LayerIndex, 0),
+        # Shared ZeroGradSlot key/sign Variables are broadcast across layers.
+        (True, None),
+    )
+)
+
+
+@nnx.scan(
+    in_axes=(nnx.Carry, _LAYER_SCAN_AXES),
+    out_axes=nnx.Carry,
+    graph=True,
+)
+def _scan_delta_layer(x: jax.Array, layer: IntDeltaBlock) -> jax.Array:
+    """Apply stacked layers sequentially as one XLA scan."""
+    return layer(x)
+
+
 def _egg_embed_init(rng: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype) -> jax.Array:
     """EGG int8 embedding init for ``nnx.Embed``."""
     del dtype
@@ -473,12 +493,17 @@ class IntRnnLM(nnx.Module):
             embedding_init=_egg_embed_init,
             rngs=rngs,
         )
-        self.layers = nnx.List(
-            [
-                IntDeltaBlock(rngs=rngs, delta_impl=delta_impl)
-                for _ in range(int(num_layers))
-            ]
-        )
+        layers = int(num_layers)
+
+        @nnx.split_rngs(splits=layers)
+        @nnx.vmap(in_axes=(0,), out_axes=0)
+        def create_layer(layer_rngs: nnx.Rngs):
+            return IntDeltaBlock(rngs=layer_rngs, delta_impl=delta_impl)
+
+        # Parameters carry one leading layer axis and are consumed by
+        # ``_scan_delta_layer``. This avoids Python-unrolling twelve copies of
+        # the block into the candidate executable.
+        self.layers = create_layer(rngs)
         self.norm_f = IntAffine(EMBED_DIM, bits=BITS, egg=True, rngs=rngs)
 
     def _prepare_embed_factors(self) -> tuple[jax.Array, jax.Array] | None:
@@ -504,9 +529,7 @@ class IntRnnLM(nnx.Module):
         """Token ids → int8 hidden states ``[B, T, D]`` (no vocab projection)."""
         x = self._embed_rows(tokens, embed_factors)
         # No positional embeddings — recurrence carries order.
-        for layer in self.layers:
-            x = layer(x)
-        return self.norm_f(x)
+        return self.norm_f(_scan_delta_layer(x, self.layers))
 
     def _logits_chunk(
         self,

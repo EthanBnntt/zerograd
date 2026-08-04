@@ -74,6 +74,47 @@ def int_matrix_factors(key: Array, shape: Sequence[int], rank: int) -> tuple[Arr
     )
 
 
+def stacked_matrix_factors(
+    key: Array,
+    shape: Sequence[int],
+    rank: int,
+    *,
+    dtype: jnp.dtype,
+) -> tuple[Array, Array]:
+    """Draw independent matrix factors for ``[layers, in, out]`` weights."""
+    layers, in_features, out_features = _validate_shape(shape, 3, "stacked matrix shape")
+    layer_ids = jnp.arange(layers, dtype=jnp.int32)
+
+    def one(layer_id):
+        return matrix_factors(
+            jax.random.fold_in(key, layer_id),
+            (in_features, out_features),
+            rank,
+            dtype=dtype,
+        )
+
+    return jax.vmap(one)(layer_ids)
+
+
+def stacked_int_matrix_factors(
+    key: Array,
+    shape: Sequence[int],
+    rank: int,
+) -> tuple[Array, Array]:
+    """Draw independent int8 factors for ``[layers, in, out]`` weights."""
+    layers, in_features, out_features = _validate_shape(shape, 3, "stacked matrix shape")
+    layer_ids = jnp.arange(layers, dtype=jnp.int32)
+
+    def one(layer_id):
+        return int_matrix_factors(
+            jax.random.fold_in(key, layer_id),
+            (in_features, out_features),
+            rank,
+        )
+
+    return jax.vmap(one)(layer_ids)
+
+
 def table_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dtype) -> tuple[Array, Array]:
     """Draw A[rows, rank], B[cols, rank] for a table leaf shaped [rows, cols]."""
     rows, columns = _validate_shape(shape, 2, "table shape")
@@ -129,3 +170,28 @@ def int_vector_noise(key: Array, shape: Sequence[int]) -> Array:
 
     (size,) = _validate_shape(shape, 1, "vector shape")
     return int8_from_normal(key, (size,))
+
+
+def stacked_vector_noise(
+    key: Array,
+    shape: Sequence[int],
+    *,
+    dtype: jnp.dtype,
+) -> Array:
+    """Draw independent vector noise for ``[layers, size]`` parameters."""
+    layers, size = _validate_shape(shape, 2, "stacked vector shape")
+    return jax.vmap(
+        lambda layer_id: vector_noise(
+            jax.random.fold_in(key, layer_id), (size,), dtype=dtype
+        )
+    )(jnp.arange(layers, dtype=jnp.int32))
+
+
+def stacked_int_vector_noise(key: Array, shape: Sequence[int]) -> Array:
+    """Draw independent int8 noise for ``[layers, size]`` parameters."""
+    layers, size = _validate_shape(shape, 2, "stacked vector shape")
+    return jax.vmap(
+        lambda layer_id: int_vector_noise(
+            jax.random.fold_in(key, layer_id), (size,)
+        )
+    )(jnp.arange(layers, dtype=jnp.int32))
