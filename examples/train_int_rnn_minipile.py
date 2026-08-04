@@ -1125,7 +1125,7 @@ def main():
     )
     print(
         f"Chance NLL={chance_nll:.3f}  chance PPL={chance_ppl:.1f}  "
-        f"(Qwen subword)",
+        f"({args.tokenizer_mode} tokens)",
         flush=True,
     )
 
