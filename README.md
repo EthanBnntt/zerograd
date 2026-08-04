@@ -81,7 +81,9 @@ for step in range(steps):
 Workers can be mixed across CPU and GPU, or multiple shards can share a
 single GPU. For a 4× GPU node, pass all four devices — each gets a quarter
 of the population. See `examples/train_distributed_cpu_gpu.py` and
-`examples/train_distributed_dual_worker.py` for runnable demos.
+`examples/train_distributed_dual_worker.py` for runnable demos (both are
+thin wrappers around `examples/train_distributed_xor.py --devices ...`,
+which takes an arbitrary comma-separated device/weight topology).
 
 For asymmetric compute (slow CPU + fast GPU, or mixed GPU generations),
 pass ``weights`` to assign more candidates to faster devices:
