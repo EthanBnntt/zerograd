@@ -1,7 +1,7 @@
 """JAX + Optax primitives for zero-gradient evolutionary optimization."""
 
 from ._candidate import CandidateContext, perturbed_int_linear, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
-from ._cluster import ClusterZeroGrad, ModelBuilder, ZeroGradNode
+from ._cluster import ClusterZeroGrad, ZeroGradNode
 from ._distributed import (
     CalibrationResult,
     DeviceShard,
@@ -76,7 +76,6 @@ __all__ = [
     "IntSpatialProj",
     "Manifest",
     "ManifestEntry",
-    "ModelBuilder",
     "ModelLossFn",
     "NodeStatus",
     "ParameterLayout",
