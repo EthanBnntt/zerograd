@@ -21,8 +21,8 @@ Gated Delta Rule-2 (Yang et al., 2026) decouples erase ``b`` and write ``w``.
 H100 efficiency notes:
   - Mixer in-proj is **one** int8 GEMM ``D→6D`` (q/k/v/α/b/w) then per-slice LUTs
     so Tensor Cores see a fat IU8 matmul instead of six ``D×D`` launches.
-  - Chunkwise WY never materializes ``[BH,C,C,hd]`` decay ratios; feature-tiled
-    pairwise dots keep VRAM for larger ``--batch`` / ``--candidate-chunk``.
+  - Chunkwise WY factorizes per-feature decay and uses dense ``[C,D]@[D,C]``
+    score GEMMs; it never materializes ``[BH,C,C,hd]`` ratio tensors.
 
     uv pip install datasets transformers
     # Compute-first on ~16GB (wide body, small batch×pop)
@@ -86,6 +86,9 @@ GDN_FEAT_TILE = 32
 Q8_F = float(Q8)
 _EPS = 1e-6
 _LOG_CLIP = 60.0
+# Keep recurrent retention high enough that a whole WY chunk has a stable,
+# factorable decay range. Erase/write gates still span (0, 1].
+_ALPHA_FLOOR = 0.95
 _IDENTITY_LUT = jnp.arange(-128, 128, dtype=jnp.int8)
 
 
@@ -168,6 +171,12 @@ def _q8_to_f_gate(x: jax.Array) -> jax.Array:
     return jnp.clip(x.astype(jnp.float32) / Q8_F, _EPS, 1.0)
 
 
+def _q8_to_f_decay(x: jax.Array) -> jax.Array:
+    """Unsigned Q8 → high-retention recurrent decay in ``[0.95, 1]``."""
+    gate = jnp.clip(x.astype(jnp.float32) / Q8_F, 0.0, 1.0)
+    return _ALPHA_FLOOR + (1.0 - _ALPHA_FLOOR) * gate
+
+
 def _quantize_gdn_out(o_f: jax.Array) -> jax.Array:
     """Float mixer output → int8 (shared by stepwise and chunkwise)."""
     return egg_clip_cast(jnp.rint(o_f * Q8_F))
@@ -206,7 +215,7 @@ def _gdn2_stepwise_scan(
     """Token-serial GDN-2: same float recurrence as WY, int8 in/out."""
     bh, t, d = q.shape
     qf, kf, vf = _q8_to_f_act(q), _q8_to_f_act(k), _q8_to_f_act(v)
-    af = _q8_to_f_gate(alpha)
+    af = _q8_to_f_decay(alpha)
     bf, wf = _q8_to_f_gate(erase), _q8_to_f_gate(write)
     step_in = jnp.stack(
         [
@@ -239,38 +248,19 @@ def _decay_weighted_dots(
     tril_k: int,
     feat_tile: int,
 ) -> jax.Array:
-    """``tril_k(Σ_i left_r,i · right_s,i · exp(G_r−G_s)_i)`` without ``[C,C,D]``.
+    """Dense decay-weighted score GEMM without ``[BH,C,C,D]`` ratios.
 
-    Processes the feature axis in tiles of size ``feat_tile`` so peak temps are
-    ``[BH,C,C,tile]`` instead of ``[BH,C,C,hd]`` (≈``hd/tile``× less VRAM) while
-    matching the pairwise-ratio numerics used by the paper WY form.
+    ``exp(G_r-G_s)`` factorizes as ``exp(G_r)·exp(-G_s)``.  The high-retention
+    alpha parameterization keeps a 64-token chunk's exponent range small, so
+    two scaled ``[C,D]`` operands feed one dense Tensor Core-friendly GEMM.
     """
-    bh, c, d = left.shape
-    tile = max(1, int(feat_tile))
-    pad = (tile - (d % tile)) % tile
-    if pad:
-        zpad = ((0, 0), (0, 0), (0, pad))
-        left = jnp.pad(left, zpad)
-        right = jnp.pad(right, zpad)
-        log_g = jnp.pad(log_g, zpad)
-    d_pad = d + pad
-    n_tiles = d_pad // tile
-
-    # Scan axis first: [n_tiles, BH, C, tile]
-    left_s = left.reshape(bh, c, n_tiles, tile).transpose(2, 0, 1, 3)
-    right_s = right.reshape(bh, c, n_tiles, tile).transpose(2, 0, 1, 3)
-    log_s = log_g.reshape(bh, c, n_tiles, tile).transpose(2, 0, 1, 3)
-
-    def tile_step(acc: jax.Array, inputs: tuple[jax.Array, jax.Array, jax.Array]):
-        sl, sr, lg = inputs
-        d_log = lg[:, :, None, :] - lg[:, None, :, :]
-        ratio = jnp.exp(jnp.clip(d_log, -_LOG_CLIP, _LOG_CLIP))
-        contrib = jnp.einsum("bcd,bsd,bcsd->bcs", sl, sr, ratio)
-        return acc + contrib, None
-
-    acc0 = jnp.zeros((bh, c, c), dtype=jnp.float32)
-    acc, _ = jax.lax.scan(tile_step, acc0, (left_s, right_s, log_s))
-    return jnp.tril(acc, k=tril_k)
+    del feat_tile  # retained as a backwards-compatible CLI argument
+    gamma = jnp.exp(log_g)
+    inv_gamma = jnp.exp(-log_g)
+    lhs = left * gamma
+    rhs = right * inv_gamma
+    scores = jnp.matmul(lhs, jnp.swapaxes(rhs, -1, -2))
+    return jnp.tril(scores, k=tril_k)
 
 
 def _gdn2_chunkwise_wy(
@@ -324,7 +314,7 @@ def _gdn2_chunkwise_wy(
     def chunk_step(s_prev: jax.Array, inputs: tuple):
         q_ch, k_ch, v_ch, a_ch, b_ch, w_ch = inputs
         qf, kf, vf = _q8_to_f_act(q_ch), _q8_to_f_act(k_ch), _q8_to_f_act(v_ch)
-        af = _q8_to_f_gate(a_ch)
+        af = _q8_to_f_decay(a_ch)
         bf, wf = _q8_to_f_gate(b_ch), _q8_to_f_gate(w_ch)
 
         e = bf * kf
@@ -360,8 +350,8 @@ class MultiHeadGatedDelta2Mixer(nnx.Module):
 
     Input projections ``q/k/v/α/b/w`` share one int8 GEMM ``D→6D`` (H100-friendly
     IU8 Tensor Core shape) then per-branch ``IntLUT``s. Intra-chunk uses the
-    paper WY form in float32 with feature-tiled decay dots; inter-chunk scan
-    carries state. Gates stay int8 Q8.
+    paper WY form in float32 with factorized dense score GEMMs; inter-chunk
+    scan carries state. Gates stay int8 Q8.
     """
 
     def __init__(self, *, rngs: nnx.Rngs, impl: str = "chunkwise"):
@@ -956,8 +946,7 @@ def main():
         "--gdn-feat-tile",
         type=int,
         default=GDN_FEAT_TILE,
-        help="Feature tile for memory-light WY decay dots (lower=less VRAM, "
-        "higher=fewer scan steps). Try 16–64 on H100.",
+        help="Deprecated compatibility option; dense WY no longer feature-tiles.",
     )
     parser.add_argument(
         "--prefetch",
@@ -1052,8 +1041,8 @@ def main():
     print(f"JAX devices: {jax.devices()}")
     print(f"Default backend: {jax.default_backend()}")
     print(
-        f"VRAM tips: fused D→6D int8 in-proj + memory-light WY "
-        f"(feat_tile={GDN_FEAT_TILE}); widen --dim / --candidate-chunk / --batch; "
+        f"GPU path: fused D→6D int8 in-proj + dense factorized WY; "
+        f"widen --dim / --candidate-chunk / --batch; "
         f"CE logit_chunk={LOGIT_CHUNK} ce_parallel={CE_PARALLEL}; "
         f"candidate_chunk={chunk!r}",
         flush=True,

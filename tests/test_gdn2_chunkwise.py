@@ -75,7 +75,7 @@ class TestGdn2ChunkwiseMatchesStepwise:
         write = _rand_q8(keys[5], (bh, t, d), gate=True)
 
         qf, kf, vf = mod._q8_to_f_act(q), mod._q8_to_f_act(k), mod._q8_to_f_act(v)
-        af = mod._q8_to_f_gate(alpha)
+        af = mod._q8_to_f_decay(alpha)
         bf, wf = mod._q8_to_f_gate(erase), mod._q8_to_f_gate(write)
 
         s = jnp.zeros((bh, d, d), dtype=jnp.float32)
