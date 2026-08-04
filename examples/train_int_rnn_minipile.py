@@ -980,6 +980,12 @@ def main():
     )
     parser.add_argument("--lr", type=float, default=1.0)
     parser.add_argument(
+        "--check-finite",
+        action="store_true",
+        help="Synchronize every optimizer step to raise on non-finite losses. "
+        "Off by default for fully asynchronous GPU execution; warmup is always checked.",
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Log metrics to Weights & Biases (uses ~/.netrc / WANDB_API_KEY)",
@@ -1089,6 +1095,7 @@ def main():
             update_alpha=args.update_alpha,
             alpha_decay=args.alpha_decay,
             candidate_chunk_size=chunk,
+            check_finite=args.check_finite,
         )
         assert optimizer.integer_es and optimizer._bin_updates
         update_mode = (
@@ -1105,6 +1112,7 @@ def main():
             sigma_shift=args.sigma_shift,
             int_bits=BITS,
             candidate_chunk_size=chunk,
+            check_finite=args.check_finite,
         )
         update_mode = f"AdamW→snap lr={args.lr} σ̂={args.sigma_shift}"
 
@@ -1164,6 +1172,8 @@ def main():
     t0 = time.time()
     model, state, metrics = optimizer.step(state, model, warm, loss_fn)
     jax.block_until_ready(metrics.mean_loss)
+    if not bool(jnp.isfinite(metrics.mean_loss)):
+        raise FloatingPointError("non-finite candidate loss during warmup")
     warm_nll, warm_ppl = nll_and_ppl(model, warm[0], warm[1])
     jax.block_until_ready(warm_nll)
     compile_s = time.time() - t0
