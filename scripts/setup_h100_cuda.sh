@@ -20,7 +20,8 @@ uv pip install \
   "numpy" \
   "datasets" \
   "transformers" \
-  "huggingface_hub"
+  "huggingface_hub" \
+  "wandb"
 
 .venv/bin/python - <<'PY'
 import jax
