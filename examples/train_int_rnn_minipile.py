@@ -166,6 +166,11 @@ def _q8_to_f_act(x: jax.Array) -> jax.Array:
     return x.astype(jnp.float32) / Q8_F
 
 
+def _q8_to_f_qk(x: jax.Array) -> jax.Array:
+    """Q/K conversion with standard head-dimension normalization."""
+    return _q8_to_f_act(x) / math.sqrt(float(x.shape[-1]))
+
+
 def _q8_to_f_gate(x: jax.Array) -> jax.Array:
     """Unsigned Q8 → (0, 1] for α / erase / write gates."""
     return jnp.clip(x.astype(jnp.float32) / Q8_F, _EPS, 1.0)
@@ -214,7 +219,7 @@ def _gdn2_stepwise_scan(
 ) -> jax.Array:
     """Token-serial GDN-2: same float recurrence as WY, int8 in/out."""
     bh, t, d = q.shape
-    qf, kf, vf = _q8_to_f_act(q), _q8_to_f_act(k), _q8_to_f_act(v)
+    qf, kf, vf = _q8_to_f_qk(q), _q8_to_f_qk(k), _q8_to_f_act(v)
     af = _q8_to_f_decay(alpha)
     bf, wf = _q8_to_f_gate(erase), _q8_to_f_gate(write)
     step_in = jnp.stack(
@@ -319,7 +324,7 @@ def _gdn2_chunkwise_wy(
 
     def chunk_step(s_prev: jax.Array, inputs: tuple):
         q_ch, k_ch, v_ch, a_ch, b_ch, w_ch = inputs
-        qf, kf, vf = _q8_to_f_act(q_ch), _q8_to_f_act(k_ch), _q8_to_f_act(v_ch)
+        qf, kf, vf = _q8_to_f_qk(q_ch), _q8_to_f_qk(k_ch), _q8_to_f_act(v_ch)
         af = _q8_to_f_decay(a_ch)
         bf, wf = _q8_to_f_gate(b_ch), _q8_to_f_gate(w_ch)
 

@@ -74,7 +74,7 @@ class TestGdn2ChunkwiseMatchesStepwise:
         erase = _rand_q8(keys[4], (bh, t, d), gate=True)
         write = _rand_q8(keys[5], (bh, t, d), gate=True)
 
-        qf, kf, vf = mod._q8_to_f_act(q), mod._q8_to_f_act(k), mod._q8_to_f_act(v)
+        qf, kf, vf = mod._q8_to_f_qk(q), mod._q8_to_f_qk(k), mod._q8_to_f_act(v)
         af = mod._q8_to_f_decay(alpha)
         bf, wf = mod._q8_to_f_gate(erase), mod._q8_to_f_gate(write)
 
