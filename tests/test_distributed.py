@@ -4,15 +4,18 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
+from flax import nnx
 
 from zerograd import (
     CalibrationResult,
     DeviceShard,
     DistributedZeroGrad,
+    IntLinear,
     Manifest,
     ManifestEntry,
     ParameterLayout,
     ShardResult,
+    ReplicatedDistributedZeroGrad,
     ZeroGrad,
     compute_partition_sizes,
 )
@@ -281,3 +284,69 @@ class TestCalibrate:
 def np_allclose(a, b):
     import numpy as np
     np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-5, atol=1e-5)
+
+
+class _TinyIntModel(nnx.Module):
+    def __init__(self, seed: int = 0):
+        self.linear = IntLinear(4, 2, egg=True, rngs=nnx.Rngs(seed))
+
+    def __call__(self, x):
+        return self.linear(x)
+
+
+def _tiny_int_loss(model, batch):
+    prediction = model(batch).astype(jnp.float32)
+    return jnp.mean(prediction**2), None
+
+
+class TestReplicatedDistributedZeroGrad:
+    def test_replicas_exchange_only_losses_and_stay_synced(self):
+        device = _a_device()
+
+        def optimizer_factory():
+            return ZeroGrad(
+                population_size=8,
+                rank=2,
+                seed=7,
+                run_id="replicated-test",
+                integer_es=True,
+                candidate_chunk_size=4,
+                check_finite=False,
+            )
+
+        with ReplicatedDistributedZeroGrad(
+            devices=[device, device],
+            optimizer_factory=optimizer_factory,
+            model_factory=lambda: _TinyIntModel(0),
+            loss_fn=_tiny_int_loss,
+        ) as distributed:
+            assert distributed.partition_sizes == [4, 4]
+            assert distributed.losses_bytes_per_step == 8 * 4 * 3
+            model, state, metrics = distributed.step(
+                jnp.ones((16, 4), dtype=jnp.int8)
+            )
+            assert state.generation == 1
+            assert metrics.population_size == 8
+            assert model is distributed.model
+            assert distributed.verify_sync()
+
+    def test_shutdown_blocks_future_steps(self):
+        device = _a_device()
+
+        def optimizer_factory():
+            return ZeroGrad(
+                population_size=4,
+                rank=1,
+                seed=0,
+                integer_es=True,
+            )
+
+        distributed = ReplicatedDistributedZeroGrad(
+            devices=[device],
+            optimizer_factory=optimizer_factory,
+            model_factory=lambda: _TinyIntModel(0),
+            loss_fn=_tiny_int_loss,
+        )
+        distributed.shutdown()
+        with pytest.raises(RuntimeError):
+            distributed.step(jnp.ones((2, 4), dtype=jnp.int8))

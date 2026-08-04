@@ -2,7 +2,14 @@
 
 from ._candidate import CandidateContext, perturbed_int_linear, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
 from ._cluster import ClusterZeroGrad, ModelBuilder, ZeroGradNode
-from ._distributed import CalibrationResult, DeviceShard, DistributedZeroGrad, ShardResult, compute_partition_sizes
+from ._distributed import (
+    CalibrationResult,
+    DeviceShard,
+    DistributedZeroGrad,
+    ReplicatedDistributedZeroGrad,
+    ShardResult,
+    compute_partition_sizes,
+)
 from ._fault_tolerant import FaultTolerantCluster, NodeStatus
 from ._factors import matrix_factors, scaled_factor, table_factors, vector_noise
 from ._fitness import shape_centered_loss, validate_losses
@@ -70,6 +77,7 @@ __all__ = [
     "ModelLossFn",
     "NodeStatus",
     "ParameterLayout",
+    "ReplicatedDistributedZeroGrad",
     "ParameterPath",
     "ParameterTree",
     "ShardResult",
