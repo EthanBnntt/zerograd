@@ -16,6 +16,8 @@ import jax.numpy as jnp
 from flax import nnx
 
 import train_int_rnn_minipile as train
+from int_rnn import model as rnn_model
+from int_rnn import train_loop as rnn_train_loop
 from zerograd import ReplicatedDistributedZeroGrad, ZeroGrad
 
 
@@ -83,9 +85,9 @@ def main() -> None:
         ffn_mult=args.ffn_mult,
         seq_len=args.seq_len,
     )
-    train.LOGIT_CHUNK = args.logit_chunk
-    train.CE_PARALLEL = 1
-    train.DELTA_CHUNK = args.delta_chunk
+    rnn_train_loop.LOGIT_CHUNK = args.logit_chunk
+    rnn_train_loop.CE_PARALLEL = 1
+    rnn_model.DELTA_CHUNK = args.delta_chunk
 
     tokenizer = train.load_tokenizer(args.tokenizer, mode=args.tokenizer_mode)
     vocab_size = len(tokenizer)
@@ -145,16 +147,12 @@ def main() -> None:
         "max_hours": args.max_hours,
     }
 
-    wb = None
-    if not args.no_wandb:
-        import wandb
-
-        wb = wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=run_config,
-        )
-        print(f"W&B run: {wb.url}", flush=True)
+    wb = rnn_train_loop.maybe_init_wandb(
+        not args.no_wandb,
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config=run_config,
+    )
 
     distributed = ReplicatedDistributedZeroGrad(
         devices=devices,
