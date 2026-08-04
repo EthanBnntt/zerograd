@@ -50,7 +50,10 @@ def replay_entry(
     def factors_for_candidate(cid):
         ck = candidate_key(base_key, cid)
         gk = group_key(ck, manifest, group)
-        if entry.layout is ParameterLayout.MATRIX:
+        if entry.layout in (
+            ParameterLayout.MATRIX,
+            ParameterLayout.STACKED_MATRIX,
+        ):
             if parameter.ndim == 3:
                 return stacked_matrix_factors(
                     gk, parameter.shape, rank, dtype=parameter.dtype
@@ -65,7 +68,10 @@ def replay_entry(
                 )
             return vector_noise(gk, parameter.shape, dtype=parameter.dtype)
 
-    if entry.layout is ParameterLayout.MATRIX:
+    if entry.layout in (
+        ParameterLayout.MATRIX,
+        ParameterLayout.STACKED_MATRIX,
+    ):
         a_pop, b_pop = jax.vmap(factors_for_candidate)(candidate_ids)
         weight_shape = (shaped_weights.shape[0],) + (1,) * (a_pop.ndim - 1)
         weighted_a = a_pop * shaped_weights.reshape(weight_shape)
@@ -109,7 +115,10 @@ def replay_entry_integer(
         ck = candidate_key(base_key, pid)
         gk = group_key(ck, manifest, group)
         if param_is_float:
-            if entry.layout is ParameterLayout.MATRIX:
+            if entry.layout in (
+                ParameterLayout.MATRIX,
+                ParameterLayout.STACKED_MATRIX,
+            ):
                 if parameter.ndim == 3:
                     return stacked_matrix_factors(
                         gk, parameter.shape, rank, dtype=parameter.dtype
@@ -122,7 +131,10 @@ def replay_entry_integer(
                     gk, parameter.shape, dtype=parameter.dtype
                 )
             return vector_noise(gk, parameter.shape, dtype=parameter.dtype)
-        if entry.layout is ParameterLayout.MATRIX:
+        if entry.layout in (
+            ParameterLayout.MATRIX,
+            ParameterLayout.STACKED_MATRIX,
+        ):
             if parameter.ndim == 3:
                 return stacked_int_matrix_factors(gk, parameter.shape, rank)
             return int_matrix_factors(gk, parameter.shape, rank)
@@ -137,7 +149,10 @@ def replay_entry_integer(
     use_float = param_is_float or jnp.issubdtype(
         getattr(f, "dtype", jnp.float32), jnp.floating
     )
-    if entry.layout is ParameterLayout.MATRIX:
+    if entry.layout in (
+        ParameterLayout.MATRIX,
+        ParameterLayout.STACKED_MATRIX,
+    ):
         a_pop, b_pop = jax.vmap(factors_for_pair)(pair_ids)
         weight_shape = (f.shape[0],) + (1,) * (a_pop.ndim - 1)
         if use_float:

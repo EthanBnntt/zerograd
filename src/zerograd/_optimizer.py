@@ -466,9 +466,18 @@ class ZeroGrad:
         sig = _tree_sig(params)
         jit_fn = self._bin_update_jit_cache.get(sig)
         if jit_fn is None:
+            from ._integer import qrange
+
+            qmin, qmax = qrange(self._int_bits)
 
             def _update(params_p, evidence_p):
-                return apply_bin_updates(params_p, evidence_p, thresholds)
+                return apply_bin_updates(
+                    params_p,
+                    evidence_p,
+                    thresholds,
+                    qmin=qmin,
+                    qmax=qmax,
+                )
 
             jit_fn = jax.jit(_update)
             self._bin_update_jit_cache[sig] = jit_fn

@@ -18,8 +18,10 @@ class ParameterLayout(StrEnum):
     """Factor algebra selected for a manifest parameter leaf."""
 
     MATRIX = "matrix"
+    STACKED_MATRIX = "stacked_matrix"
     TABLE = "table"
     VECTOR = "vector"
+    STACKED_VECTOR = "stacked_vector"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,17 +120,15 @@ class Manifest:
         """Check all selected paths and layout dimensionalities before a step."""
         for entry in self.entries:
             parameter = self.resolve(params, entry.path)
-            expected_ndim = 1 if entry.layout is ParameterLayout.VECTOR else 2
-            # A leading layer axis is supported for scanned modules:
-            # VECTOR [layers, size], MATRIX [layers, in, out].
-            valid_ndims = (
-                (expected_ndim,)
-                if entry.layout is ParameterLayout.TABLE
-                else (expected_ndim, expected_ndim + 1)
-            )
-            if parameter.ndim not in valid_ndims:
+            expected_ndim = {
+                ParameterLayout.VECTOR: 1,
+                ParameterLayout.STACKED_VECTOR: 2,
+                ParameterLayout.MATRIX: 2,
+                ParameterLayout.TABLE: 2,
+                ParameterLayout.STACKED_MATRIX: 3,
+            }[entry.layout]
+            if parameter.ndim != expected_ndim:
                 raise ValueError(
                     f"{entry.layout.value} parameter {'.'.join(entry.path)} must be "
-                    f"{expected_ndim}-D or layer-stacked {expected_ndim + 1}-D, "
-                    f"got shape {parameter.shape}"
+                    f"{expected_ndim}-D, got shape {parameter.shape}"
                 )

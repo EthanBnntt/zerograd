@@ -78,7 +78,7 @@ def test_scanned_int_gdn_runs_one_integer_es_step():
         for entry in optimizer.manifest.entries
         if entry.path == ("layers", "mixer", "in_proj", "kernel")
     )
-    assert layer_kernel.layout.value == "matrix"
+    assert layer_kernel.layout.value == "stacked_matrix"
 
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
 

@@ -75,6 +75,22 @@ def _layout_from_param(param: nnx.Param) -> ParameterLayout:
     )
 
 
+def _matrix_layout(param: nnx.Param) -> ParameterLayout:
+    return (
+        ParameterLayout.STACKED_MATRIX
+        if param[...].ndim == 3
+        else ParameterLayout.MATRIX
+    )
+
+
+def _vector_layout(param: nnx.Param) -> ParameterLayout:
+    return (
+        ParameterLayout.STACKED_VECTOR
+        if param[...].ndim == 2
+        else ParameterLayout.VECTOR
+    )
+
+
 def _path_str(path: tuple[Any, ...]) -> str:
     return ".".join(str(p) for p in path)
 
@@ -1304,7 +1320,7 @@ def apply_surgery(
                 leaf = _path_tuple(child_path)
                 kg = _path_str(child_path + ("kernel",))
                 entries.append(
-                    ManifestEntry(leaf + ("kernel",), ParameterLayout.MATRIX, kg)
+                    ManifestEntry(leaf + ("kernel",), _matrix_layout(value.kernel), kg)
                 )
                 bg = None
                 if value.use_bias and value.bias is not None:
@@ -1317,7 +1333,7 @@ def apply_surgery(
                 leaf = _path_tuple(child_path)
                 kg = _path_str(child_path + ("kernel",))
                 entries.append(
-                    ManifestEntry(leaf + ("kernel",), ParameterLayout.MATRIX, kg)
+                    ManifestEntry(leaf + ("kernel",), _matrix_layout(value.kernel), kg)
                 )
                 bg = None
                 if value.use_bias and value.bias is not None:
@@ -1330,7 +1346,7 @@ def apply_surgery(
                 leaf = _path_tuple(child_path)
                 g = _path_str(child_path + ("table",))
                 entries.append(
-                    ManifestEntry(leaf + ("table",), ParameterLayout.VECTOR, g)
+                    ManifestEntry(leaf + ("table",), _vector_layout(value.table), g)
                 )
                 setattr(module, name, ZgIntLUT(value, slot, g))
             elif isinstance(value, TernaryLinear):
@@ -1403,8 +1419,9 @@ def apply_surgery(
             leaf = _path_tuple(child_path)
             if layout is ParameterLayout.VECTOR:
                 g = _path_str(child_path + ("param",))
+                entry_layout = _vector_layout(value)
                 entries.append(
-                    ManifestEntry(leaf + ("param",), ParameterLayout.VECTOR, g)
+                    ManifestEntry(leaf + ("param",), entry_layout, g)
                 )
                 setattr(module, name, ZgVector(value, slot, g))
             elif layout is ParameterLayout.TABLE:

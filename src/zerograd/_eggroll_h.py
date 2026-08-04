@@ -106,7 +106,7 @@ def bin_update_threshold(
     z = _normal_ppf(1.0 - alpha / 2.0)
     # Common: z · √N · 16¹
     scale = INT8_FACTOR_SCALE * z * math.sqrt(float(num_directions))
-    if layout is ParameterLayout.VECTOR:
+    if layout in (ParameterLayout.VECTOR, ParameterLayout.STACKED_VECTOR):
         return int(math.floor(scale))
     # MATRIX / TABLE: second factor of 16 from A@B / table factors.
     return int(math.floor(scale * INT8_FACTOR_SCALE))
