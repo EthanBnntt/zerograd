@@ -57,16 +57,15 @@ class Int8CnnClassifier(nnx.Module):
     """Integer CNN + learnable int8 LUT nonlinearities + int8 MLP head."""
 
     def __init__(self, rngs: nnx.Rngs):
-        # out_shift=7 keeps more activation energy than 8 for ES signal.
-        self.conv1 = IntConv(3, 32, kernel_size=3, out_shift=7, egg=False, rngs=rngs)
+        self.conv1 = IntConv(3, 32, kernel_size=3, rngs=rngs)
         self.act1 = IntLUT(init="identity", explore_shift=0, rngs=rngs)
-        self.conv2 = IntConv(32, 64, kernel_size=3, out_shift=7, egg=False, rngs=rngs)
+        self.conv2 = IntConv(32, 64, kernel_size=3, rngs=rngs)
         self.act2 = IntLUT(init="identity", explore_shift=0, rngs=rngs)
         # 8×8×64 = 4096 after two stride-2 pools
-        self.fc = IntLinear(4096, 128, out_shift=7, bits=8, rngs=rngs)
+        self.fc = IntLinear(4096, 128, bits=8, rngs=rngs)
         self.act3 = IntLUT(init="identity", explore_shift=0, rngs=rngs)
         self.head = IntLinear(
-            128, NUM_CLASSES, out_shift=7, bits=8, act_dtype=jnp.int32, rngs=rngs
+            128, NUM_CLASSES, bits=8, act_dtype=jnp.int32, rngs=rngs
         )
 
     def __call__(self, images: jax.Array) -> jax.Array:

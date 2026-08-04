@@ -29,8 +29,8 @@ class IntMLP(nnx.Module):
 
     def __init__(self, din: int, hidden: int, dout: int, *, rngs: nnx.Rngs, bits: int = 8):
         self.bits = bits
-        self.l1 = IntLinear(din, hidden, bits=bits, out_shift=6, rngs=rngs)
-        self.l2 = IntLinear(hidden, dout, bits=bits, out_shift=6, act_dtype=jnp.int32, rngs=rngs)
+        self.l1 = IntLinear(din, hidden, bits=bits, rngs=rngs)
+        self.l2 = IntLinear(hidden, dout, bits=bits, act_dtype=jnp.int32, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         from zerograd._integer import int_relu
