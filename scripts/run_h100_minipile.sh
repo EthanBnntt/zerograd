@@ -23,6 +23,20 @@ else
   PYTHON="uv run python"
 fi
 
+WANDB_ARGS=()
+if [ "${WANDB:-1}" != "0" ]; then
+  WANDB_ARGS+=(--wandb)
+  if [ -n "${WANDB_PROJECT:-}" ]; then
+    WANDB_ARGS+=(--wandb-project "$WANDB_PROJECT")
+  fi
+  if [ -n "${WANDB_ENTITY:-}" ]; then
+    WANDB_ARGS+=(--wandb-entity "$WANDB_ENTITY")
+  fi
+  if [ -n "${WANDB_RUN_NAME:-}" ]; then
+    WANDB_ARGS+=(--wandb-run-name "$WANDB_RUN_NAME")
+  fi
+fi
+
 $PYTHON examples/train_int_rnn_minipile.py \
   --steps "${STEPS:-2000}" \
   --dim "${DIM:-2048}" \
@@ -40,6 +54,7 @@ $PYTHON examples/train_int_rnn_minipile.py \
   --gdn-feat-tile "${GDN_FEAT_TILE:-32}" \
   --logit-chunk "${LOGIT_CHUNK:-12288}" \
   --prefetch 8 \
-  --log-every 10 \
-  --gen-every 0 \
+  --log-every "${LOG_EVERY:-10}" \
+  --gen-every "${GEN_EVERY:-0}" \
+  "${WANDB_ARGS[@]}" \
   "$@"

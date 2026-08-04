@@ -942,6 +942,29 @@ def main():
         help="bins=±1 discrete updates (default); adamw=float master+snap",
     )
     parser.add_argument("--lr", type=float, default=1.0)
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Log metrics to Weights & Biases (uses ~/.netrc / WANDB_API_KEY)",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="zerograd-int-gdn",
+        help="W&B project name",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity/team",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional W&B run name (default: auto from hyperparams)",
+    )
     args = parser.parse_args()
 
     if args.population % 2 != 0:
@@ -1057,18 +1080,78 @@ def main():
         flush=True,
     )
 
+    wb = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise SystemExit(
+                "`--wandb` requires the wandb package.\n"
+                "  uv pip install wandb"
+            ) from exc
+        run_name = args.wandb_run_name or (
+            f"gdn2-d{EMBED_DIM}-L{NUM_LAYERS}-H{NUM_HEADS}-"
+            f"B{args.batch}-P{args.population}-r{args.rank}"
+        )
+        wb = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config={
+                "dim": EMBED_DIM,
+                "heads": NUM_HEADS,
+                "head_dim": HEAD_DIM,
+                "layers": NUM_LAYERS,
+                "ffn_dim": FFN_DIM,
+                "seq_len": SEQ_LEN,
+                "batch": args.batch,
+                "population": args.population,
+                "rank": args.rank,
+                "sigma_shift": args.sigma_shift,
+                "candidate_chunk": chunk,
+                "ce_parallel": CE_PARALLEL,
+                "logit_chunk": LOGIT_CHUNK,
+                "delta_impl": args.delta_impl,
+                "delta_chunk": DELTA_CHUNK,
+                "gdn_feat_tile": GDN_FEAT_TILE,
+                "update": args.update,
+                "update_alpha": args.update_alpha,
+                "vocab_size": vocab_size,
+                "params": n_params,
+                "tokenizer": args.tokenizer,
+                "device": str(jax.devices()[0]),
+            },
+        )
+        print(f"W&B run: {wb.url}", flush=True)
+
     t0 = time.time()
     model, state, metrics = optimizer.step(state, model, warm, loss_fn)
     jax.block_until_ready(metrics.mean_loss)
     warm_nll, warm_ppl = nll_and_ppl(model, warm[0], warm[1])
     jax.block_until_ready(warm_nll)
+    compile_s = time.time() - t0
     print(
-        f"compile {time.time() - t0:.1f}s  "
+        f"compile {compile_s:.1f}s  "
         f"first_loss={float(metrics.mean_loss):.4f}  "
         f"eval_nll={float(warm_nll):.4f}  ppl={float(warm_ppl):.2f}  "
         f"(chance ppl={chance_ppl:.1f})",
         flush=True,
     )
+    if wb is not None:
+        wb.log(
+            {
+                "compile_s": compile_s,
+                "train/loss": float(metrics.mean_loss),
+                "eval/nll": float(warm_nll),
+                "eval/ppl": float(warm_ppl),
+                "eval/best_nll": float(warm_nll),
+                "lut/changed": float(n_lut),
+                "lut/mean_abs": float(m_lut),
+                "chance/nll": chance_nll,
+                "chance/ppl": chance_ppl,
+            },
+            step=int(metrics.generation),
+        )
     if args.gen_every > 0:
         print_sample(
             model,
@@ -1121,6 +1204,22 @@ def main():
                     f"({dt:.2f}s/step, {elapsed / 60:.1f}m)",
                     flush=True,
                 )
+                if wb is not None:
+                    tokens_per_s = (args.batch * SEQ_LEN) / max(dt, 1e-6)
+                    wb.log(
+                        {
+                            "train/loss": float(metrics.mean_loss),
+                            "eval/nll": nll_f,
+                            "eval/ppl": ppl_f,
+                            "eval/best_nll": best_nll,
+                            "lut/changed": float(n_lut),
+                            "lut/mean_abs": float(m_lut),
+                            "perf/step_s": dt,
+                            "perf/tokens_per_s": tokens_per_s,
+                            "perf/elapsed_s": elapsed,
+                        },
+                        step=gen,
+                    )
 
             if args.gen_every > 0 and gen % args.gen_every == 0:
                 print_sample(
@@ -1134,6 +1233,8 @@ def main():
                 )
     finally:
         batcher.close()
+        if wb is not None:
+            wb.finish()
 
     assert _all_integer_params(model)
     if args.gen_every > 0:
