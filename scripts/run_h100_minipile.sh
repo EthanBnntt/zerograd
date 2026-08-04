@@ -40,6 +40,12 @@ if [ "${WANDB:-1}" != "0" ]; then
   fi
 fi
 
+CHECKPOINT_ARGS=()
+if [ -n "${CHECKPOINT_OUT:-}" ]; then
+  CHECKPOINT_ARGS+=(--checkpoint-out "$CHECKPOINT_OUT")
+  CHECKPOINT_ARGS+=(--checkpoint-every "${CHECKPOINT_EVERY:-0}")
+fi
+
 $PYTHON examples/train_int_rnn_minipile.py \
   --steps "${STEPS:-2000}" \
   --dim "${DIM:-2048}" \
@@ -64,4 +70,5 @@ $PYTHON examples/train_int_rnn_minipile.py \
   --log-every "${LOG_EVERY:-10}" \
   --gen-every "${GEN_EVERY:-0}" \
   "${WANDB_ARGS[@]}" \
+  "${CHECKPOINT_ARGS[@]}" \
   "$@"

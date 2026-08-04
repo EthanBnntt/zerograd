@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import argparse
 import math
+import pickle
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Iterator
 
 import jax
@@ -62,7 +64,7 @@ from zerograd import (
     egg_clip_cast,
 )
 from zerograd._integer import egg_init_matrix, egg_matmul_divisor, int_matmul
-from zerograd._nnx import LayerIndex, disable_candidates, params_pure_dict
+from zerograd._nnx import LayerIndex, disable_candidates, params_pure_dict, update_params
 
 # ── Architecture defaults (overridden by CLI via ``configure_architecture``) ─
 DEFAULT_TOKENIZER = "Qwen/Qwen3.6-27B"
@@ -815,6 +817,41 @@ def count_params(model: nnx.Module) -> int:
     return int(sum(v.size for v in leaves))
 
 
+def save_checkpoint(
+    model: IntRnnLM,
+    path: str | Path,
+    *,
+    generation: int,
+    config: dict,
+) -> Path:
+    """Atomically save trusted local model parameters and reconstruction config."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format": "zerograd-int-rnn-v1",
+        "generation": int(generation),
+        "config": dict(config),
+        "params": jax.tree.map(lambda value: np.asarray(value), params_pure_dict(model)),
+    }
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    temporary.replace(target)
+    return target
+
+
+def load_checkpoint(model: IntRnnLM, path: str | Path) -> dict:
+    """Load a trusted checkpoint created by :func:`save_checkpoint`."""
+    with Path(path).expanduser().open("rb") as handle:
+        payload = pickle.load(handle)  # noqa: S301 - explicitly trusted local artifact
+    if payload.get("format") != "zerograd-int-rnn-v1":
+        raise ValueError("unsupported integer RNN checkpoint format")
+    params = jax.tree.map(jnp.asarray, payload["params"])
+    update_params(model, params)
+    disable_candidates(model)
+    return payload
+
+
 def _all_integer_params(model: nnx.Module) -> bool:
     return all(
         jnp.issubdtype(v.dtype, jnp.integer)
@@ -1050,6 +1087,18 @@ def main():
         "Off by default for fully asynchronous GPU execution; warmup is always checked.",
     )
     parser.add_argument(
+        "--checkpoint-out",
+        type=str,
+        default=None,
+        help="Checkpoint path. Saves atomically at exit and on interruption.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Also overwrite --checkpoint-out every N generations (0 disables periodic saves).",
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Log metrics to Weights & Biases (uses ~/.netrc / WANDB_API_KEY)",
@@ -1076,6 +1125,10 @@ def main():
 
     if args.population % 2 != 0:
         raise SystemExit("--population must be even (integer_es antithetical pairs)")
+    if args.checkpoint_every < 0:
+        raise SystemExit("--checkpoint-every must be >= 0")
+    if args.checkpoint_every and not args.checkpoint_out:
+        raise SystemExit("--checkpoint-every requires --checkpoint-out")
 
     configure_architecture(
         dim=args.dim,
@@ -1196,6 +1249,35 @@ def main():
         flush=True,
     )
 
+    run_config = {
+        "dim": EMBED_DIM,
+        "heads": NUM_HEADS,
+        "head_dim": HEAD_DIM,
+        "layers": NUM_LAYERS,
+        "ffn_mult": FFN_MULT,
+        "ffn_dim": FFN_DIM,
+        "seq_len": SEQ_LEN,
+        "batch": args.batch,
+        "population": args.population,
+        "rank": args.rank,
+        "sigma_shift": args.sigma_shift,
+        "candidate_chunk": chunk,
+        "ce_parallel": CE_PARALLEL,
+        "logit_chunk": LOGIT_CHUNK,
+        "delta_impl": args.delta_impl,
+        "delta_chunk": DELTA_CHUNK,
+        "gdn_feat_tile": GDN_FEAT_TILE,
+        "update": args.update,
+        "update_alpha": args.update_alpha,
+        "alpha_decay": args.alpha_decay,
+        "vocab_size": vocab_size,
+        "params": n_params,
+        "tokenizer": args.tokenizer,
+        "tokenizer_mode": args.tokenizer_mode,
+        "seed": args.seed,
+        "device": str(jax.devices()[0]),
+    }
+
     wb = None
     if args.wandb:
         try:
@@ -1213,31 +1295,7 @@ def main():
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=run_name,
-            config={
-                "dim": EMBED_DIM,
-                "heads": NUM_HEADS,
-                "head_dim": HEAD_DIM,
-                "layers": NUM_LAYERS,
-                "ffn_dim": FFN_DIM,
-                "seq_len": SEQ_LEN,
-                "batch": args.batch,
-                "population": args.population,
-                "rank": args.rank,
-                "sigma_shift": args.sigma_shift,
-                "candidate_chunk": chunk,
-                "ce_parallel": CE_PARALLEL,
-                "logit_chunk": LOGIT_CHUNK,
-                "delta_impl": args.delta_impl,
-                "delta_chunk": DELTA_CHUNK,
-                "gdn_feat_tile": GDN_FEAT_TILE,
-                "update": args.update,
-                "update_alpha": args.update_alpha,
-                "vocab_size": vocab_size,
-                "params": n_params,
-                "tokenizer": args.tokenizer,
-                "tokenizer_mode": args.tokenizer_mode,
-                "device": str(jax.devices()[0]),
-            },
+            config=run_config,
         )
         print(f"W&B run: {wb.url}", flush=True)
 
@@ -1364,8 +1422,37 @@ def main():
                     temperature=args.temperature,
                     seed=args.seed,
                 )
+            if (
+                args.checkpoint_out
+                and args.checkpoint_every > 0
+                and state.generation % args.checkpoint_every == 0
+            ):
+                saved = save_checkpoint(
+                    model,
+                    args.checkpoint_out,
+                    generation=state.generation,
+                    config=run_config,
+                )
+                print(
+                    f"  checkpoint generation={state.generation} path={saved}",
+                    flush=True,
+                )
+                # Serialization synchronizes the queue; start a fresh timing window.
+                perf_window_start = time.time()
+                perf_window_steps = 0
     finally:
         batcher.close()
+        if args.checkpoint_out:
+            saved = save_checkpoint(
+                model,
+                args.checkpoint_out,
+                generation=state.generation,
+                config=run_config,
+            )
+            print(
+                f"Saved checkpoint generation={state.generation} path={saved}",
+                flush=True,
+            )
         if wb is not None:
             wb.finish()
 
