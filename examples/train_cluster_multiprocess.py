@@ -37,12 +37,13 @@ import optax
 import numpy as np
 
 from zerograd import ZeroGrad, compute_partition_sizes
+from zerograd._nnx import params_pure_dict
 from _xor_model import (
     HIDDEN_DIM,
     INPUT_DIM,
     OUTPUT_DIM,
-    build_manifest,
-    build_params,
+    accuracy,
+    build_model,
     loss_fn,
 )
 
@@ -129,9 +130,7 @@ def _recv_checked(proc, stderr_sink, timeout=60.0):
 
 def run_worker(seed, pop, rank, sigma, lr):
     """Worker: computes params from seed, communicates only via losses."""
-    manifest = build_manifest()
     optimizer = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=lr, weight_decay=0.0),
         population_size=pop,
         rank=rank,
@@ -140,9 +139,9 @@ def run_worker(seed, pop, rank, sigma, lr):
         run_id="mp-cluster-xor",
     )
 
-    # Compute params from seed — never received from coordinator
-    params = build_params(jax.random.key(seed))
-    state = optimizer.init(params)
+    # Compute model from seed — never received from coordinator
+    model = build_model(jax.random.key(seed))
+    state = optimizer.init(model)
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
@@ -163,17 +162,17 @@ def run_worker(seed, pop, rank, sigma, lr):
             candidate_ids = jnp.array(task[1])
             gen = state.generation
             losses = optimizer.evaluate_shard(
-                params, gen, loss_fn, batch, candidate_ids)
+                model, gen, loss_fn, batch, candidate_ids)
             # Send losses as numpy (tiny: pop/nodes floats)
             _send(np.array(losses, dtype=np.float32), stdout)
 
         elif cmd == "step":
             losses = jnp.array(task[1])
-            params, state, metrics = optimizer.step_from_losses(state, params, losses)
+            model, state, metrics = optimizer.step_from_losses(state, model, losses)
             _send((metrics.generation, metrics.mean_loss, metrics.min_loss), stdout)
 
         elif cmd == "get_params":
-            leaves = jax.tree_util.tree_leaves(params)
+            leaves = jax.tree_util.tree_leaves(params_pure_dict(model))
             _send([np.array(x) for x in leaves], stdout)
 
     _send("done", stdout)
@@ -307,9 +306,7 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
 
     # Check against single-node baseline
     print("\n  Comparing against single-node baseline...")
-    manifest = build_manifest()
     opt_single = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=lr, weight_decay=0.0),
         population_size=pop,
         rank=rank,
@@ -317,13 +314,13 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
         seed=seed,
         run_id="mp-cluster-xor",
     )
-    params_s = build_params(jax.random.key(seed))
-    state_s = opt_single.init(params_s)
+    model_s = build_model(jax.random.key(seed))
+    state_s = opt_single.init(model_s)
     batch_jax = (jnp.array(xor_x), jnp.array(xor_y))
     for step in range(steps):
-        params_s, state_s, _ = opt_single.step(state_s, params_s, batch_jax, loss_fn)
+        model_s, state_s, _ = opt_single.step(state_s, model_s, batch_jax, loss_fn)
 
-    single_leaves = [np.array(x) for x in jax.tree_util.tree_leaves(params_s)]
+    single_leaves = [np.array(x) for x in jax.tree_util.tree_leaves(params_pure_dict(model_s))]
     baseline_match = True
     for a, b in zip(worker_params[0], single_leaves):
         diff = np.max(np.abs(a - b))
@@ -334,18 +331,7 @@ def run_coordinator(nodes, steps, pop, rank, sigma, lr, seed):
 
     print(f"  Cluster matches single-node baseline: {'✓' if baseline_match else '✗'}")
 
-    # Accuracy — tree_leaves returns sorted by key: b1, b2, w1, w2
-    leaves = worker_params[0]
-    params_dict = {
-        "b1": jnp.array(leaves[0]),
-        "b2": jnp.array(leaves[1]),
-        "w1": jnp.array(leaves[2]),
-        "w2": jnp.array(leaves[3]),
-    }
-    h = jax.nn.tanh(jnp.array(xor_x) @ params_dict["w1"]) + params_dict["b1"]
-    logits = h @ params_dict["w2"] + params_dict["b2"]
-    preds = (logits > 0.5).astype(jnp.float32)
-    acc = float(jnp.mean(preds == jnp.array(xor_y)))
+    acc = accuracy(model_s)
     print(f"  Final accuracy: {acc:.0%}")
 
     total_time = time.time() - t0

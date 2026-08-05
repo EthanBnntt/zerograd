@@ -7,6 +7,8 @@ import math
 import jax
 import jax.numpy as jnp
 
+from ._manifest import ParameterTree
+
 Array = jax.Array
 
 # Signed int4 stored in int8 containers (JAX has no native int4 dtype).
@@ -298,11 +300,11 @@ def int_mean(x: Array, axis: int = -1, keepdims: bool = True) -> Array:
 
 
 def snap_tree_to_integer(
-    updated: Array | dict,
-    template: Array | dict,
+    updated: Array | ParameterTree,
+    template: Array | ParameterTree,
     *,
     bits: int | None = None,
-) -> Array | dict:
+) -> Array | ParameterTree:
     """Round/clip Optax float updates back onto the template's integer dtypes.
 
     When ``bits`` is set (e.g. 4), int8 leaves are clipped to that signed range
@@ -318,11 +320,12 @@ def snap_tree_to_integer(
             lo, hi = qrange(bits)
         else:
             lo, hi = int(info.min), int(info.max)
+        assert isinstance(updated, jax.Array)
         return jnp.clip(jnp.rint(updated), lo, hi).astype(template.dtype)
     return updated
 
 
-def float_view_tree(params: Array | dict) -> Array | dict:
+def float_view_tree(params: Array | ParameterTree) -> Array | ParameterTree:
     """Cast integer leaves to float32 for Optax state / apply_updates."""
     if isinstance(params, dict):
         return {k: float_view_tree(v) for k, v in params.items()}

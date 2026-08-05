@@ -9,25 +9,24 @@ from stable graph paths for deterministic replay.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from flax.nnx.nn.linear import _conv_dimension_numbers, canonicalize_padding
 
 from ._candidate import (
     perturbed_conv,
     perturbed_int_conv,
     perturbed_int_linear,
-    perturbed_int_table_lookup,
-    perturbed_int_table_lookup_prepared,
-    perturbed_int_vector,
     perturbed_linear,
     perturbed_table_lookup,
     perturbed_table_lookup_prepared,
     perturbed_tied_logits,
     perturbed_vector,
 )
+from ._factors import table_factors
 from ._integer import (
     EGG_I8_MAX,
     EGG_I8_MIN,
@@ -36,12 +35,13 @@ from ._integer import (
     egg_requantize,
     int_conv2d_flat,
     int_matmul,
+    int_mean,
     rms_norm,
     ternary_dequant_scale,
     ternary_init,
 )
 from ._keys import group_key
-from ._manifest import Manifest, ManifestEntry, ParameterLayout
+from ._manifest import Manifest, ManifestEntry, ParameterLayout, ParameterTree
 
 Array = jax.Array
 
@@ -141,61 +141,101 @@ def _stacked_layer_index(value: Array, base_ndim: int) -> LayerIndex | None:
     return None
 
 
-def _int_table_candidate_factors(
+def _table_candidate_factors(
     table: Array, slot: "ZeroGradSlot", group: str
 ) -> tuple[Array, Array] | None:
-    """Appendix H row-sparse int8 table factors, generated once for reuse.
+    """Generate this candidate's table factors once for reuse by a loss.
 
-    Returns ``None`` when candidate perturbations are disabled.
+    Returns ``None`` when candidate perturbations are disabled. Integer tables
+    use Appendix H int8 factors; float tables use float normals.
     """
     if not slot.enabled:
         return None
-    from ._factors import int_table_factors
 
-    return int_table_factors(_factor_key(slot, group), table.shape, slot.rank)
+    integer = bool(jnp.issubdtype(table.dtype, jnp.integer))
+    return table_factors(
+        _factor_key(slot, group),
+        table.shape,
+        slot.rank,
+        dtype=None if integer else table.dtype,
+        integer=integer,
+    )
 
 
-def _int_table_lookup(
+def _table_lookup(
     table: Array,
     indices: Array,
     slot: "ZeroGradSlot",
     group: str,
     factors: tuple[Array, Array] | None = None,
 ) -> Array:
-    """Gather int table rows, optionally reusing :func:`_int_table_candidate_factors`."""
+    """Gather table rows with optional factor perturbation (float or int)."""
     if not slot.enabled:
         return table[indices]
-    if factors is None:
-        return perturbed_int_table_lookup(
+    key = _factor_key(slot, group)
+    if jnp.issubdtype(table.dtype, jnp.integer):
+        if factors is None:
+            return perturbed_table_lookup(
+                table,
+                indices,
+                key,
+                slot.rank,
+                sigma_shift=slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+        a, b = factors
+        return perturbed_table_lookup_prepared(
             table,
             indices,
-            _factor_key(slot, group),
-            slot.rank,
-            slot.sigma_shift,
+            a,
+            b,
+            sigma_shift=slot.sigma_shift,
             factor_sign=slot.factor_sign[...],
         )
+    if factors is None:
+        return perturbed_table_lookup(
+            table, indices, key, slot.rank, slot.sigma
+        )
     a, b = factors
-    return perturbed_int_table_lookup_prepared(
-        table,
-        indices,
-        a,
-        b,
-        slot.sigma_shift,
-        factor_sign=slot.factor_sign[...],
-    )
+    return perturbed_table_lookup_prepared(table, indices, a, b, slot.sigma)
 
 
-def _int_table_attend(table: Array, query: Array, slot: "ZeroGradSlot", group: str) -> Array:
-    """Tied-logit projection for an int table: perturb every row, then int matmul.
+def _table_attend(
+    table: Array, query: Array, slot: "ZeroGradSlot", group: str
+) -> Array:
+    """Tied-logit projection using the same table factors as lookup."""
+    if jnp.issubdtype(table.dtype, jnp.integer):
+        # Small-``V`` debugging path (row-sparse factors over all ids); chunked
+        # CE should prefer gather + :func:`int_matmul` directly.
+        if not slot.enabled:
+            return int_matmul(query, table.T)
+        idx = jnp.arange(table.shape[0], dtype=jnp.int32)
+        e = _table_lookup(table, idx, slot, group)
+        return int_matmul(query, e.T)
+    if slot.enabled:
+        return perturbed_tied_logits(
+            query, table, _factor_key(slot, group), slot.rank, slot.sigma
+        )
+    return query @ table.T
 
-    Small-``V`` debugging path (row-sparse factors over all ids); chunked CE
-    should prefer gather + :func:`int_matmul` directly.
-    """
-    if not slot.enabled:
-        return int_matmul(query, table.T)
-    idx = jnp.arange(table.shape[0], dtype=jnp.int32)
-    e = _int_table_lookup(table, idx, slot, group)
-    return int_matmul(query, e.T)
+
+def _maybe_perturb_vector(
+    value: Array,
+    slot: "ZeroGradSlot",
+    group: str | None,
+    *,
+    layer_index: LayerIndex | None = None,
+) -> Array:
+    """Apply float or int vector noise when the slot is enabled and ``group`` is set."""
+    if not slot.enabled or group is None:
+        return value
+    key = _factor_key(slot, group, layer_index)
+    sign = slot.factor_sign[...]
+    if jnp.issubdtype(value.dtype, jnp.integer):
+        return perturbed_vector(
+            value, key, sigma_shift=slot.sigma_shift, factor_sign=sign
+        )
+    return perturbed_vector(value, key, slot.sigma, factor_sign=sign)
 
 
 class ZgLinear(nnx.Module):
@@ -230,14 +270,9 @@ class ZgLinear(nnx.Module):
         else:
             y = x @ kernel
         if self.use_bias and self.bias is not None:
-            bias = self.bias[...]
-            if slot.enabled and self.bias_group is not None:
-                bias = perturbed_vector(
-                    bias,
-                    _factor_key(slot, self.bias_group),
-                    slot.sigma,
-                    factor_sign=slot.factor_sign[...],
-                )
+            bias = _maybe_perturb_vector(
+                self.bias[...], slot, self.bias_group
+            )
             y = y + bias
         return y
 
@@ -285,15 +320,27 @@ class ZgConv(nnx.Module):
             return (x,) * nd
         return tuple(x)
 
-    def __call__(self, x: Array) -> Array:
-        from flax.nnx.nn.linear import _conv_dimension_numbers, canonicalize_padding
+    @staticmethod
+    def _normalize_broadcast(
+        x: int | Sequence[int] | None,
+    ) -> int | tuple[int, ...] | None:
+        if isinstance(x, Sequence) and not isinstance(x, (str, bytes)):
+            return tuple(int(v) for v in x)
+        if isinstance(x, int) or x is None:
+            return x
+        return tuple(x)
 
+    def __call__(self, x: Array) -> Array:
         slot = self.slot
         kh, kw = self.kernel_hw
         kernel_2d = self.kernel[...]
-        strides = self._maybe_broadcast(self.strides)
-        input_dilation = self._maybe_broadcast(self.input_dilation)
-        kernel_dilation = self._maybe_broadcast(self.kernel_dilation)
+        strides = self._maybe_broadcast(self._normalize_broadcast(self.strides))
+        input_dilation = self._maybe_broadcast(
+            self._normalize_broadcast(self.input_dilation)
+        )
+        kernel_dilation = self._maybe_broadcast(
+            self._normalize_broadcast(self.kernel_dilation)
+        )
         padding_lax = canonicalize_padding(self.padding, len(self.kernel_hw))
         if padding_lax in ("CIRCULAR", "REFLECT", "CAUSAL"):
             raise NotImplementedError(
@@ -346,14 +393,9 @@ class ZgConv(nnx.Module):
             y = _conv(x, kernel_2d.reshape(kh, kw, self.in_features, self.out_features))
 
         if self.use_bias and self.bias is not None:
-            bias = self.bias[...]
-            if slot.enabled and self.bias_group is not None:
-                bias = perturbed_vector(
-                    bias,
-                    _factor_key(slot, self.bias_group),
-                    slot.sigma,
-                    factor_sign=slot.factor_sign[...],
-                )
+            bias = _maybe_perturb_vector(
+                self.bias[...], slot, self.bias_group
+            )
             y = y + bias.reshape((1,) * (y.ndim - 1) + bias.shape)
         return y
 
@@ -634,10 +676,11 @@ class ZgIntLUT(nnx.Module):
         lut = self.table[...]
         slot = self.slot
         if slot.enabled:
-            lut = perturbed_int_vector(
+            # Prefer explore_shift over the global σ̂ so LUTs can move under ES.
+            lut = perturbed_vector(
                 lut,
                 _factor_key(slot, self.group, self.layer_index),
-                self.explore_shift,
+                sigma_shift=self.explore_shift,
                 factor_sign=slot.factor_sign[...],
             )
         idx = x.astype(jnp.int32) - jnp.iinfo(jnp.int8).min
@@ -743,14 +786,9 @@ class ZgIntConv(nnx.Module):
                 padding=self.padding,
             )
         if self.use_bias and self.bias is not None:
-            bias = self.bias[...]
-            if slot.enabled and self.bias_group is not None:
-                bias = perturbed_int_vector(
-                    bias,
-                    _factor_key(slot, self.bias_group),
-                    slot.sigma_shift,
-                    factor_sign=slot.factor_sign[...],
-                )
+            bias = _maybe_perturb_vector(
+                self.bias[...], slot, self.bias_group
+            )
             y = y + bias.astype(jnp.int32).reshape((1, 1, 1, -1))
         fan_in = kh * kw * self.in_features
         return egg_requantize(y, fan_in, act_dtype=jnp.int8)
@@ -791,24 +829,14 @@ class ZgIntLinear(nnx.Module):
         else:
             y = int_matmul(x, kernel)
         if self.use_bias and self.bias is not None:
-            bias = self.bias[...]
-            if slot.enabled and self.bias_group is not None:
-                # Integer leaves → int factors; float leaves stay on float noise
-                # even when integer_es=True (mixed ternary + scale models).
-                if jnp.issubdtype(bias.dtype, jnp.integer):
-                    bias = perturbed_int_vector(
-                        bias,
-                        _factor_key(slot, self.bias_group, self.layer_index),
-                        slot.sigma_shift,
-                        factor_sign=slot.factor_sign[...],
-                    )
-                else:
-                    bias = perturbed_vector(
-                        bias,
-                        _factor_key(slot, self.bias_group, self.layer_index),
-                        slot.sigma,
-                        factor_sign=slot.factor_sign[...],
-                    )
+            # Integer leaves → int factors; float leaves stay on float noise
+            # even when integer_es=True (mixed ternary + scale models).
+            bias = _maybe_perturb_vector(
+                self.bias[...],
+                slot,
+                self.bias_group,
+                layer_index=self.layer_index,
+            )
             y = y + bias.astype(jnp.int32)
         return egg_requantize(y, self.in_features, act_dtype=self.act_dtype)
 
@@ -839,8 +867,6 @@ class IntAffine(nnx.Module):
         self.bias.set_metadata(**{LAYOUT_METADATA_KEY: ParameterLayout.VECTOR.value})
 
     def __call__(self, x: Array) -> Array:
-        from ._integer import int_mean
-
         scale = self.scale() if isinstance(self.scale, ZgVector) else self.scale[...]
         bias = self.bias() if isinstance(self.bias, ZgVector) else self.bias[...]
         mean = int_mean(x, axis=-1, keepdims=True)
@@ -881,37 +907,6 @@ class IntEmbedding(nnx.Module):
         return int_matmul(query, self.embedding[...].T)
 
 
-class ZgIntEmbedding(nnx.Module):
-    """``IntEmbedding`` with Appendix H row-sparse int8 table perturbations."""
-
-    def __init__(self, embed: IntEmbedding, slot: ZeroGradSlot, group: str) -> None:
-        self.embedding = embed.embedding
-        self.num_embeddings = embed.num_embeddings
-        self.features = embed.features
-        self.slot = slot
-        self.group = group
-
-    def __call__(self, indices: Array) -> Array:
-        return self.lookup(indices, factors=None)
-
-    def candidate_factors(self) -> tuple[Array, Array] | None:
-        """Generate this candidate's table factors once for reuse by a loss."""
-        return _int_table_candidate_factors(self.embedding[...], self.slot, self.group)
-
-    def lookup(
-        self,
-        indices: Array,
-        *,
-        factors: tuple[Array, Array] | None,
-    ) -> Array:
-        """Gather rows, optionally reusing :meth:`candidate_factors` output."""
-        return _int_table_lookup(self.embedding[...], indices, self.slot, self.group, factors)
-
-    def attend(self, query: Array) -> Array:
-        """Tied-logit projection using the same table factors as ``__call__``."""
-        return _int_table_attend(self.embedding[...], query, self.slot, self.group)
-
-
 class ZgEmbed(nnx.Module):
     """``nnx.Embed`` replacement with factor-only table perturbations.
 
@@ -934,20 +929,7 @@ class ZgEmbed(nnx.Module):
 
         Returns ``None`` when candidate perturbations are disabled.
         """
-        table = self.embedding[...]
-        slot = self.slot
-        if jnp.issubdtype(table.dtype, jnp.integer):
-            return _int_table_candidate_factors(table, slot, self.group)
-        if not slot.enabled:
-            return None
-        from ._factors import table_factors
-
-        return table_factors(
-            _factor_key(slot, self.group),
-            table.shape,
-            slot.rank,
-            dtype=table.dtype,
-        )
+        return _table_candidate_factors(self.embedding[...], self.slot, self.group)
 
     def lookup(
         self,
@@ -956,36 +938,28 @@ class ZgEmbed(nnx.Module):
         factors: tuple[Array, Array] | None,
     ) -> Array:
         """Gather rows, optionally reusing :meth:`candidate_factors` output."""
-        table = self.embedding[...]
-        slot = self.slot
-        if jnp.issubdtype(table.dtype, jnp.integer):
-            return _int_table_lookup(table, indices, slot, self.group, factors)
-        if not slot.enabled:
-            return table[indices]
-        if factors is None:
-            return perturbed_table_lookup(
-                table, indices, _factor_key(slot, self.group), slot.rank, slot.sigma
-            )
-        a, b = factors
-        return perturbed_table_lookup_prepared(
-            table,
-            indices,
-            a,
-            b,
-            slot.sigma,
+        return _table_lookup(
+            self.embedding[...], indices, self.slot, self.group, factors
         )
 
     def attend(self, query: Array) -> Array:
         """Tied-logit projection using the same table factors as ``__call__``."""
-        table = self.embedding[...]
-        slot = self.slot
-        if jnp.issubdtype(table.dtype, jnp.integer):
-            return _int_table_attend(table, query, slot, self.group)
-        if slot.enabled:
-            return perturbed_tied_logits(
-                query, table, _factor_key(slot, self.group), slot.rank, slot.sigma
-            )
-        return query @ table.T
+        return _table_attend(self.embedding[...], query, self.slot, self.group)
+
+
+class ZgIntEmbedding(ZgEmbed):
+    """``IntEmbedding`` with Appendix H row-sparse int8 table perturbations.
+
+    Thin subclass of :class:`ZgEmbed`: the int8 table dtype selects the shared
+    ``_table_*`` path. Prefer this over wrapping ``nnx.Embed`` for EGG LMs.
+    """
+
+    def __init__(self, embed: IntEmbedding, slot: ZeroGradSlot, group: str) -> None:
+        self.embedding = embed.embedding
+        self.num_embeddings = embed.num_embeddings
+        self.features = embed.features
+        self.slot = slot
+        self.group = group
 
 
 class ZgLayerNorm(nnx.Module):
@@ -1013,24 +987,14 @@ class ZgLayerNorm(nnx.Module):
         y = (x - mean) / jnp.sqrt(var + self.epsilon)
         slot = self.slot
         if self.use_scale and self.scale is not None:
-            scale = self.scale[...]
-            if slot.enabled and self.scale_group is not None:
-                scale = perturbed_vector(
-                    scale,
-                    _factor_key(slot, self.scale_group),
-                    slot.sigma,
-                    factor_sign=slot.factor_sign[...],
-                )
+            scale = _maybe_perturb_vector(
+                self.scale[...], slot, self.scale_group
+            )
             y = y * scale
         if self.use_bias and self.bias is not None:
-            bias = self.bias[...]
-            if slot.enabled and self.bias_group is not None:
-                bias = perturbed_vector(
-                    bias,
-                    _factor_key(slot, self.bias_group),
-                    slot.sigma,
-                    factor_sign=slot.factor_sign[...],
-                )
+            bias = _maybe_perturb_vector(
+                self.bias[...], slot, self.bias_group
+            )
             y = y + bias
         return y
 
@@ -1045,25 +1009,14 @@ class ZgVector(nnx.Module):
         self.layer_index = _stacked_layer_index(param[...], 1)
 
     def _read(self) -> Array:
-        value = self.param[...]
-        slot = self.slot
-        if slot.enabled:
-            # Perturbation dtype follows the leaf, not the global integer_es flag
-            # (ternary kernels are int; γ / RMS / bias stay float).
-            if jnp.issubdtype(value.dtype, jnp.integer):
-                return perturbed_int_vector(
-                    value,
-                    _factor_key(slot, self.group, self.layer_index),
-                    slot.sigma_shift,
-                    factor_sign=slot.factor_sign[...],
-                )
-            return perturbed_vector(
-                value,
-                _factor_key(slot, self.group, self.layer_index),
-                slot.sigma,
-                factor_sign=slot.factor_sign[...],
-            )
-        return value
+        # Perturbation dtype follows the leaf, not the global integer_es flag
+        # (ternary kernels are int; γ / RMS / bias stay float).
+        return _maybe_perturb_vector(
+            self.param[...],
+            self.slot,
+            self.group,
+            layer_index=self.layer_index,
+        )
 
     def __call__(self) -> Array:
         return self._read()
@@ -1081,26 +1034,10 @@ class ZgTable(nnx.Module):
         self.group = group
 
     def __getitem__(self, indices: Array) -> Array:
-        table = self.param[...]
-        slot = self.slot
-        if jnp.issubdtype(table.dtype, jnp.integer):
-            return _int_table_lookup(table, indices, slot, self.group)
-        if slot.enabled:
-            return perturbed_table_lookup(
-                table, indices, _factor_key(slot, self.group), slot.rank, slot.sigma
-            )
-        return table[indices]
+        return _table_lookup(self.param[...], indices, self.slot, self.group)
 
     def attend(self, query: Array) -> Array:
-        table = self.param[...]
-        slot = self.slot
-        if jnp.issubdtype(table.dtype, jnp.integer):
-            return _int_table_attend(table, query, slot, self.group)
-        if slot.enabled:
-            return perturbed_tied_logits(
-                query, table, _factor_key(slot, self.group), slot.rank, slot.sigma
-            )
-        return query @ table.T
+        return _table_attend(self.param[...], query, self.slot, self.group)
 
 
 def _is_surged(module: object) -> bool:
@@ -1123,6 +1060,45 @@ def _is_surged(module: object) -> bool:
     )
 
 
+def _replace_matrix_layer(
+    module: nnx.Module,
+    name: str,
+    child_path: tuple,
+    value: Any,
+    slot: ZeroGradSlot,
+    entries: list[ManifestEntry],
+    *,
+    zg_cls: type,
+    layout_fn: Callable[[nnx.Param], ParameterLayout],
+) -> None:
+    """Append kernel/bias manifest entries and replace ``value`` with a Zg wrapper."""
+    leaf = _path_tuple(child_path)
+    kg = _path_str(child_path + ("kernel",))
+    entries.append(ManifestEntry(leaf + ("kernel",), layout_fn(value.kernel), kg))
+    bg: str | None = None
+    if value.use_bias and value.bias is not None:
+        bg = _path_str(child_path + ("bias",))
+        entries.append(ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg))
+    setattr(module, name, zg_cls(value, slot, kg, bg))
+
+
+def _replace_embed_layer(
+    module: nnx.Module,
+    name: str,
+    child_path: tuple,
+    value: Any,
+    slot: ZeroGradSlot,
+    entries: list[ManifestEntry],
+    *,
+    zg_cls: type,
+) -> None:
+    """Append embedding TABLE entry and replace ``value`` with a Zg embed wrapper."""
+    leaf = _path_tuple(child_path)
+    g = _path_str(child_path + ("embedding",))
+    entries.append(ManifestEntry(leaf + ("embedding",), ParameterLayout.TABLE, g))
+    setattr(module, name, zg_cls(value, slot, g))
+
+
 def apply_surgery(
     model: nnx.Module,
     *,
@@ -1140,8 +1116,8 @@ def apply_surgery(
     if not isinstance(model, nnx.Module):
         raise TypeError("apply_surgery expects an nnx.Module")
 
-    if hasattr(model, "zg_slot") and isinstance(getattr(model, "zg_slot"), ZeroGradSlot):
-        slot: ZeroGradSlot = model.zg_slot
+    if hasattr(model, "zg_slot") and isinstance(getattr(model, "zg_slot", None), ZeroGradSlot):
+        slot: ZeroGradSlot = getattr(model, "zg_slot")
         slot.rank = rank
         slot.sigma = sigma
         slot.sigma_shift = int(sigma_shift)
@@ -1150,69 +1126,40 @@ def apply_surgery(
         slot = ZeroGradSlot(
             rank=rank, sigma=sigma, sigma_shift=sigma_shift, integer_es=integer_es
         )
-        model.zg_slot = slot
+        setattr(model, "zg_slot", slot)
 
     entries: list[ManifestEntry] = []
 
     # Pass 1: replace Linear / IntLinear / Embed / LayerNorm (collect entries as we go).
+    _matrix_surgery = (
+        (nnx.Linear, ZgLinear, lambda _: ParameterLayout.MATRIX),
+        (nnx.Conv, ZgConv, lambda _: ParameterLayout.MATRIX),
+        (IntLinear, ZgIntLinear, _matrix_layout),
+        (IntConv, ZgIntConv, _matrix_layout),
+    )
     for path, module in list(nnx.iter_graph(model)):
         if not isinstance(module, nnx.Module) or _is_surged(module):
             continue
         for name, value in list(vars(module).items()):
             child_path = path + (name,)
-            if isinstance(value, nnx.Linear):
-                leaf = _path_tuple(child_path)
-                kg = _path_str(child_path + ("kernel",))
-                entries.append(
-                    ManifestEntry(leaf + ("kernel",), ParameterLayout.MATRIX, kg)
-                )
-                bg: str | None = None
-                if value.use_bias and value.bias is not None:
-                    bg = _path_str(child_path + ("bias",))
-                    entries.append(
-                        ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
+            replaced = False
+            for base_cls, zg_cls, layout_fn in _matrix_surgery:
+                if isinstance(value, base_cls):
+                    _replace_matrix_layer(
+                        module,
+                        name,
+                        child_path,
+                        value,
+                        slot,
+                        entries,
+                        zg_cls=zg_cls,
+                        layout_fn=layout_fn,
                     )
-                setattr(module, name, ZgLinear(value, slot, kg, bg))
-            elif isinstance(value, nnx.Conv):
-                leaf = _path_tuple(child_path)
-                kg = _path_str(child_path + ("kernel",))
-                entries.append(
-                    ManifestEntry(leaf + ("kernel",), ParameterLayout.MATRIX, kg)
-                )
-                bg = None
-                if value.use_bias and value.bias is not None:
-                    bg = _path_str(child_path + ("bias",))
-                    entries.append(
-                        ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
-                    )
-                setattr(module, name, ZgConv(value, slot, kg, bg))
-            elif isinstance(value, IntLinear):
-                leaf = _path_tuple(child_path)
-                kg = _path_str(child_path + ("kernel",))
-                entries.append(
-                    ManifestEntry(leaf + ("kernel",), _matrix_layout(value.kernel), kg)
-                )
-                bg = None
-                if value.use_bias and value.bias is not None:
-                    bg = _path_str(child_path + ("bias",))
-                    entries.append(
-                        ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
-                    )
-                setattr(module, name, ZgIntLinear(value, slot, kg, bg))
-            elif isinstance(value, IntConv):
-                leaf = _path_tuple(child_path)
-                kg = _path_str(child_path + ("kernel",))
-                entries.append(
-                    ManifestEntry(leaf + ("kernel",), _matrix_layout(value.kernel), kg)
-                )
-                bg = None
-                if value.use_bias and value.bias is not None:
-                    bg = _path_str(child_path + ("bias",))
-                    entries.append(
-                        ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
-                    )
-                setattr(module, name, ZgIntConv(value, slot, kg, bg))
-            elif isinstance(value, IntLUT):
+                    replaced = True
+                    break
+            if replaced:
+                continue
+            if isinstance(value, IntLUT):
                 leaf = _path_tuple(child_path)
                 g = _path_str(child_path + ("table",))
                 entries.append(
@@ -1243,19 +1190,13 @@ def apply_surgery(
                     )
                 setattr(module, name, ZgTernaryLinear(value, slot, kg, gg, rg, bg))
             elif isinstance(value, IntEmbedding):
-                leaf = _path_tuple(child_path)
-                g = _path_str(child_path + ("embedding",))
-                entries.append(
-                    ManifestEntry(leaf + ("embedding",), ParameterLayout.TABLE, g)
+                _replace_embed_layer(
+                    module, name, child_path, value, slot, entries, zg_cls=ZgIntEmbedding
                 )
-                setattr(module, name, ZgIntEmbedding(value, slot, g))
             elif isinstance(value, nnx.Embed):
-                leaf = _path_tuple(child_path)
-                g = _path_str(child_path + ("embedding",))
-                entries.append(
-                    ManifestEntry(leaf + ("embedding",), ParameterLayout.TABLE, g)
+                _replace_embed_layer(
+                    module, name, child_path, value, slot, entries, zg_cls=ZgEmbed
                 )
-                setattr(module, name, ZgEmbed(value, slot, g))
             elif isinstance(value, nnx.LayerNorm):
                 leaf = _path_tuple(child_path)
                 sg: str | None = None
@@ -1346,34 +1287,13 @@ def params_pure_dict(model: nnx.Module) -> dict:
     Dict keys are stringified so they match Manifest paths (``nnx.List`` uses
     integer indices in the raw NNX state).
     """
-    return _stringify_keys(nnx.state(model, nnx.Param).to_pure_dict())
+    return _stringify_keys(nnx.to_pure_dict(nnx.state(model, nnx.Param)))
 
 
-def update_params(model: nnx.Module, pure_dict: dict) -> None:
+def update_params(model: nnx.Module, pure_dict: ParameterTree) -> None:
     """Write an Optax-updated pure param dict back onto ``model``."""
-    template = nnx.state(model, nnx.Param).to_pure_dict()
+    template = nnx.to_pure_dict(nnx.state(model, nnx.Param))
     nnx.update(model, _restore_keys(pure_dict, template))
-
-
-def _set_slot_binding(tree: Any, key: Array, factor_sign: Array) -> Any:
-    """Return a pure-dict copy with ZeroGradSlot ``key`` / ``factor_sign`` replaced."""
-    if not isinstance(tree, dict):
-        return tree
-    out: dict = {}
-    for k, v in tree.items():
-        if k in ("slot", "zg_slot") and isinstance(v, dict) and "key" in v:
-            slot = {}
-            for sk, sv in v.items():
-                if sk == "key":
-                    slot[sk] = key
-                elif sk == "factor_sign":
-                    slot[sk] = factor_sign
-                else:
-                    slot[sk] = _set_slot_binding(sv, key, factor_sign)
-            out[k] = slot
-        else:
-            out[k] = _set_slot_binding(v, key, factor_sign)
-    return out
 
 
 def bind_candidate(
@@ -1392,7 +1312,7 @@ def bind_candidate(
     # This avoids full state -> dict recursion plus an extra merge/split/merge
     # cycle in every candidate trace.
     flat_state = []
-    for path, variable in state.flat_state():
+    for path, variable in nnx.to_flat_state(state):
         if len(path) >= 2 and path[-2] in ("slot", "zg_slot"):
             if path[-1] == "key":
                 variable = variable.replace(candidate_key_val)
@@ -1405,19 +1325,16 @@ def bind_candidate(
             # another NNX transform (the layer scan); array storage stays shared.
             variable = variable.copy()
         flat_state.append((path, variable))
-    bound_state = type(state).from_flat_path(flat_state)
+    bound_state = nnx.from_flat_state(flat_state)
     model = nnx.merge(graphdef, bound_state)
-    if hasattr(model, "zg_slot") and isinstance(model.zg_slot, ZeroGradSlot):
-        model.zg_slot.enabled = enabled
+    slot = getattr(model, "zg_slot", None)
+    if isinstance(slot, ZeroGradSlot):
+        slot.enabled = enabled
     return model
-
-
-def _set_slot_keys(tree: Any, key: Array) -> Any:
-    """Backward-compatible key-only slot rewrite."""
-    return _set_slot_binding(tree, key, jnp.int32(1))
 
 
 def disable_candidates(model: nnx.Module) -> None:
     """Turn off candidate perturbations (eval / inference)."""
-    if hasattr(model, "zg_slot") and isinstance(model.zg_slot, ZeroGradSlot):
-        model.zg_slot.enabled = False
+    slot = getattr(model, "zg_slot", None)
+    if isinstance(slot, ZeroGradSlot):
+        slot.enabled = False

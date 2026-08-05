@@ -6,13 +6,8 @@ import jax
 import jax.numpy as jnp
 
 from ._factors import (
-    int_matrix_factors,
-    int_table_factors,
-    int_vector_noise,
     matrix_factors,
     scaled_factor,
-    stacked_int_matrix_factors,
-    stacked_int_vector_noise,
     stacked_matrix_factors,
     stacked_vector_noise,
     table_factors,
@@ -26,6 +21,62 @@ Array = jax.Array
 # Tile big int tables on device during replay (Qwen embeds) to bound peak
 # [tile, cols] int32 evidence; each tile is still one bulk RNG + GEMM.
 _TABLE_ROW_TILE = 65536
+
+
+def _draw_entry_factors(
+    gk: Array,
+    entry,
+    parameter: Array,
+    rank: int,
+    *,
+    integer: bool,
+):
+    """Draw the same factors used in forward for one candidate / pair key."""
+    layout = entry.layout
+    if layout in (ParameterLayout.MATRIX, ParameterLayout.STACKED_MATRIX):
+        if parameter.ndim == 3:
+            return stacked_matrix_factors(
+                gk, parameter.shape, rank, dtype=parameter.dtype, integer=integer
+            )
+        return matrix_factors(
+            gk, parameter.shape, rank, dtype=parameter.dtype, integer=integer
+        )
+    if layout is ParameterLayout.TABLE:
+        return table_factors(
+            gk, parameter.shape, rank, dtype=parameter.dtype, integer=integer
+        )
+    if parameter.ndim == 2:
+        return stacked_vector_noise(
+            gk, parameter.shape, dtype=parameter.dtype, integer=integer
+        )
+    return vector_noise(gk, parameter.shape, dtype=parameter.dtype, integer=integer)
+
+
+def _matrix_evidence(
+    a_pop: Array, b_pop: Array, shaped_weights: Array, *, dtype: jnp.dtype
+) -> Array:
+    weight_shape = (shaped_weights.shape[0],) + (1,) * (a_pop.ndim - 1)
+    weighted_a = a_pop.astype(dtype) * shaped_weights.astype(dtype).reshape(weight_shape)
+    return jnp.einsum("p...ir,p...ro->...io", weighted_a, b_pop.astype(dtype))
+
+
+def _table_evidence_float(
+    a_pop: Array, b_pop: Array, shaped_weights: Array
+) -> Array:
+    weighted_a = a_pop.astype(jnp.float32) * shaped_weights.astype(jnp.float32)[
+        :, None, None
+    ]
+    return jnp.einsum("pxr,pyr->xy", weighted_a, b_pop.astype(jnp.float32))
+
+
+def _vector_evidence(
+    noise_pop: Array, shaped_weights: Array, *, dtype: jnp.dtype
+) -> Array:
+    weight_shape = (shaped_weights.shape[0],) + (1,) * (noise_pop.ndim - 1)
+    return jnp.sum(
+        noise_pop.astype(dtype) * shaped_weights.astype(dtype).reshape(weight_shape),
+        axis=0,
+    )
 
 
 def replay_entry(
@@ -50,44 +101,27 @@ def replay_entry(
     def factors_for_candidate(cid):
         ck = candidate_key(base_key, cid)
         gk = group_key(ck, manifest, group)
-        if entry.layout in (
-            ParameterLayout.MATRIX,
-            ParameterLayout.STACKED_MATRIX,
-        ):
-            if parameter.ndim == 3:
-                return stacked_matrix_factors(
-                    gk, parameter.shape, rank, dtype=parameter.dtype
-                )
-            return matrix_factors(gk, parameter.shape, rank, dtype=parameter.dtype)
-        elif entry.layout is ParameterLayout.TABLE:
-            return table_factors(gk, parameter.shape, rank, dtype=parameter.dtype)
-        else:
-            if parameter.ndim == 2:
-                return stacked_vector_noise(
-                    gk, parameter.shape, dtype=parameter.dtype
-                )
-            return vector_noise(gk, parameter.shape, dtype=parameter.dtype)
+        return _draw_entry_factors(gk, entry, parameter, rank, integer=False)
 
-    if entry.layout in (
-        ParameterLayout.MATRIX,
-        ParameterLayout.STACKED_MATRIX,
-    ):
+    if entry.layout in (ParameterLayout.MATRIX, ParameterLayout.STACKED_MATRIX):
         a_pop, b_pop = jax.vmap(factors_for_candidate)(candidate_ids)
         weight_shape = (shaped_weights.shape[0],) + (1,) * (a_pop.ndim - 1)
         weighted_a = a_pop * shaped_weights.reshape(weight_shape)
         return jnp.einsum(
             "p...ir,p...ro->...io", weighted_a, b_pop
         ) * scaled_factor(rank, 1.0, parameter.dtype)
-    elif entry.layout is ParameterLayout.TABLE:
+    if entry.layout is ParameterLayout.TABLE:
         a_pop, b_pop = jax.vmap(factors_for_candidate)(candidate_ids)
         weighted_a = a_pop * shaped_weights[:, None, None]
-        return jnp.einsum("pxr,pyr->xy", weighted_a, b_pop) * scaled_factor(rank, 1.0, parameter.dtype)
-    else:
-        noise_pop = jax.vmap(factors_for_candidate)(candidate_ids)
-        weight_shape = (shaped_weights.shape[0],) + (1,) * (noise_pop.ndim - 1)
-        return jnp.sum(
-            noise_pop * shaped_weights.reshape(weight_shape), axis=0
-        ) * scaled_factor(1, 1.0, parameter.dtype)
+        return jnp.einsum("pxr,pyr->xy", weighted_a, b_pop) * scaled_factor(
+            rank, 1.0, parameter.dtype
+        )
+    noise_pop = jax.vmap(factors_for_candidate)(candidate_ids)
+    assert isinstance(noise_pop, jax.Array)
+    weight_shape = (shaped_weights.shape[0],) + (1,) * (noise_pop.ndim - 1)
+    return jnp.sum(
+        noise_pop * shaped_weights.reshape(weight_shape), axis=0
+    ) * scaled_factor(1, 1.0, parameter.dtype)
 
 
 def replay_entry_integer(
@@ -110,84 +144,35 @@ def replay_entry_integer(
     # Float leaves (γ, RMS, bias, embeddings) use float factors even under
     # integer_es; only integer kernels use Appendix H int8 factors.
     param_is_float = jnp.issubdtype(parameter.dtype, jnp.floating)
+    use_int_factors = not param_is_float
 
     def factors_for_pair(pid):
         ck = candidate_key(base_key, pid)
         gk = group_key(ck, manifest, group)
-        if param_is_float:
-            if entry.layout in (
-                ParameterLayout.MATRIX,
-                ParameterLayout.STACKED_MATRIX,
-            ):
-                if parameter.ndim == 3:
-                    return stacked_matrix_factors(
-                        gk, parameter.shape, rank, dtype=parameter.dtype
-                    )
-                return matrix_factors(gk, parameter.shape, rank, dtype=parameter.dtype)
-            if entry.layout is ParameterLayout.TABLE:
-                return table_factors(gk, parameter.shape, rank, dtype=parameter.dtype)
-            if parameter.ndim == 2:
-                return stacked_vector_noise(
-                    gk, parameter.shape, dtype=parameter.dtype
-                )
-            return vector_noise(gk, parameter.shape, dtype=parameter.dtype)
-        if entry.layout in (
-            ParameterLayout.MATRIX,
-            ParameterLayout.STACKED_MATRIX,
-        ):
-            if parameter.ndim == 3:
-                return stacked_int_matrix_factors(gk, parameter.shape, rank)
-            return int_matrix_factors(gk, parameter.shape, rank)
-        if entry.layout is ParameterLayout.TABLE:
-            return int_table_factors(gk, parameter.shape, rank)
-        if parameter.ndim == 2:
-            return stacked_int_vector_noise(gk, parameter.shape)
-        return int_vector_noise(gk, parameter.shape)
+        return _draw_entry_factors(
+            gk, entry, parameter, rank, integer=use_int_factors
+        )
 
     f = shaped_weights
     # Allow int {-1,0,1} (bin path) or float centered weights (Adam path).
     use_float = param_is_float or jnp.issubdtype(
         getattr(f, "dtype", jnp.float32), jnp.floating
     )
-    if entry.layout in (
-        ParameterLayout.MATRIX,
-        ParameterLayout.STACKED_MATRIX,
-    ):
+    accum_dtype = jnp.float32 if use_float else jnp.int32
+
+    if entry.layout in (ParameterLayout.MATRIX, ParameterLayout.STACKED_MATRIX):
         a_pop, b_pop = jax.vmap(factors_for_pair)(pair_ids)
-        weight_shape = (f.shape[0],) + (1,) * (a_pop.ndim - 1)
-        if use_float:
-            weighted_a = a_pop.astype(jnp.float32) * f.astype(jnp.float32).reshape(
-                weight_shape
-            )
-            return jnp.einsum(
-                "p...ir,p...ro->...io", weighted_a, b_pop.astype(jnp.float32)
-            )
-        weighted_a = a_pop.astype(jnp.int32) * f.astype(jnp.int32).reshape(
-            weight_shape
-        )
-        return jnp.einsum(
-            "p...ir,p...ro->...io", weighted_a, b_pop.astype(jnp.int32)
-        )
+        return _matrix_evidence(a_pop, b_pop, f, dtype=accum_dtype)
     if entry.layout is ParameterLayout.TABLE:
         if not use_float:
             return _int_table_evidence(
                 parameter, base_key, group, pair_ids, f, rank, manifest
             )
         a_pop, b_pop = jax.vmap(factors_for_pair)(pair_ids)
-        weighted_a = a_pop.astype(jnp.float32) * f.astype(jnp.float32)[:, None, None]
-        return jnp.einsum("pxr,pyr->xy", weighted_a, b_pop.astype(jnp.float32))
+        return _table_evidence_float(a_pop, b_pop, f)
     noise_pop = jax.vmap(factors_for_pair)(pair_ids)
-    weight_shape = (f.shape[0],) + (1,) * (noise_pop.ndim - 1)
-    if use_float:
-        return jnp.sum(
-            noise_pop.astype(jnp.float32)
-            * f.astype(jnp.float32).reshape(weight_shape),
-            axis=0,
-        )
-    return jnp.sum(
-        noise_pop.astype(jnp.int32) * f.astype(jnp.int32).reshape(weight_shape),
-        axis=0,
-    )
+    assert isinstance(noise_pop, jax.Array)
+    return _vector_evidence(noise_pop, f, dtype=accum_dtype)
 
 
 def _int_table_evidence(
@@ -213,7 +198,7 @@ def _int_table_evidence(
     def factors_for_pair(pid):
         ck = candidate_key(base_key, pid)
         gk = group_key(ck, manifest, group)
-        return int_table_factors(gk, parameter.shape, rank)
+        return table_factors(gk, parameter.shape, rank, integer=True)
 
     a_pop, b_pop = jax.vmap(factors_for_pair)(pair_ids)
     w = shaped_weights.astype(jnp.int32)

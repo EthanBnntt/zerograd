@@ -5,7 +5,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import optax
-import pytest
 from flax import nnx
 
 from zerograd import (

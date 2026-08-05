@@ -31,7 +31,7 @@ import jax
 import optax
 
 from zerograd import DistributedZeroGrad, ZeroGrad
-from _xor_model import XOR_X, XOR_Y, accuracy, build_manifest, build_params, loss_fn
+from _xor_model import XOR_X, XOR_Y, accuracy, build_model, loss_fn
 
 
 def _parse_device_spec(spec: str) -> jax.Device:
@@ -86,12 +86,10 @@ def run(
     print_topology(devices)
     print()
 
-    params = build_params(jax.random.key(0))
-    manifest = build_manifest()
+    model = build_model(jax.random.key(0))
     batch = (XOR_X, XOR_Y)
 
     base_opt = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=lr, weight_decay=0.0),
         population_size=pop,
         rank=rank,
@@ -105,7 +103,7 @@ def run(
     with DistributedZeroGrad(
         base_opt, devices=devices, loss_fn=loss_fn, weights=weights,
     ) as dist_opt:
-        state = dist_opt.init(params)
+        state = dist_opt.init(model)
 
         for shard in dist_opt.shards:
             print(f"  {shard.name}: {shard.device}")
@@ -113,15 +111,15 @@ def run(
         print()
         t0 = time.time()
         for step in range(steps):
-            params, state, metrics = dist_opt.step(state, params, batch)
+            model, state, metrics = dist_opt.step(state, model, batch)
             if step % 50 == 0 or step == steps - 1:
-                acc = accuracy(params)
+                acc = accuracy(model)
                 print(f"  gen {metrics.generation:3d}  "
                       f"loss={metrics.mean_loss:.4f}  "
                       f"acc={acc:.0%}  "
                       f"({(time.time() - t0) / (step + 1):.2f}s/step)")
 
-        print(f"\nFinal accuracy: {accuracy(params):.0%}")
+        print(f"\nFinal accuracy: {accuracy(model):.0%}")
         print(f"Total time: {time.time() - t0:.1f}s")
 
 

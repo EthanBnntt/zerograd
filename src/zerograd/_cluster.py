@@ -42,14 +42,16 @@ network cost. Compare to backprop's O(parameters) gradient sync.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
-from ._distributed import compute_partition_sizes
+from ._distributed import compute_partition_sizes, split_candidate_ids
 from ._manifest import ParameterTree
-from ._optimizer import LossFn, StepMetrics, ZeroGrad, ZeroGradState
+from ._nnx import params_pure_dict
+from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
 ParamsBuilder = Callable[[Array], ParameterTree]
@@ -79,7 +81,7 @@ class ZeroGradNode:
         self,
         optimizer: ZeroGrad,
         build_params_fn: ParamsBuilder,
-        loss_fn: LossFn,
+        loss_fn: ModelLossFn,
         seed: int,
     ) -> None:
         self._optimizer = optimizer
@@ -98,7 +100,7 @@ class ZeroGradNode:
         """
         gen = self._state.generation
         return self._optimizer.evaluate_shard(
-            self._params, gen, self._loss_fn, batch, candidate_ids)
+            cast(nnx.Module, self._params), gen, self._loss_fn, batch, candidate_ids)
 
     def step(self, losses: Array) -> StepMetrics:
         """Apply update from gathered losses.
@@ -138,6 +140,29 @@ def _numeric_param_leaves(tree: Any) -> list[Array]:
     return leaves
 
 
+def _module_or_tree_leaves(params: Any) -> list[Array]:
+    """Numeric leaves from an ``nnx.Module`` or a pure parameter tree."""
+    tree = params_pure_dict(params) if isinstance(params, nnx.Module) else params
+    return _numeric_param_leaves(tree)
+
+
+def _trees_close(a: Any, b: Any, atol: float = 1e-5) -> bool:
+    """True if numeric param leaves of ``a`` and ``b`` match within ``atol``."""
+    leaves_a = _module_or_tree_leaves(a)
+    leaves_b = _module_or_tree_leaves(b)
+    if len(leaves_a) != len(leaves_b):
+        return False
+    for x, y in zip(leaves_a, leaves_b):
+        if x.shape != y.shape or float(jnp.max(jnp.abs(x - y))) > atol:
+            return False
+    return True
+
+
+def _param_tree_bytes(ref: Any) -> int:
+    """Byte size of numeric param leaves assuming float32 storage."""
+    return sum(v.size for v in _module_or_tree_leaves(ref)) * 4
+
+
 def evaluate_and_step(
     shards: Sequence[tuple[ZeroGradNode, Array]],
     step_nodes: Sequence[ZeroGradNode],
@@ -160,6 +185,7 @@ def evaluate_and_step(
     metrics = None
     for node in step_nodes:
         metrics = node.step(gathered)
+    assert metrics is not None
     ref = step_nodes[0]
     return ref.params, ref.state, metrics
 
@@ -194,7 +220,7 @@ class ClusterZeroGrad:
         self,
         optimizer: ZeroGrad,
         build_params_fn: ParamsBuilder,
-        loss_fn: LossFn,
+        loss_fn: ModelLossFn,
         seed: int,
         num_nodes: int = 1,
         weights: list[float] | None = None,
@@ -216,20 +242,12 @@ class ClusterZeroGrad:
         w = weights or [1.0] * num_nodes
         self._weights = w
         sizes = compute_partition_sizes(pop, w)
-        all_ids = jnp.arange(pop, dtype=jnp.int32)
-        if len(sizes) > 1:
-            split_points = jnp.cumsum(jnp.array(sizes[:-1]))
-            self._shard_ids = jnp.split(all_ids, split_points)
-        else:
-            self._shard_ids = [all_ids]
+        self._shard_ids = split_candidate_ids(pop, sizes)
         self._partition_sizes = sizes
 
         # Communication accounting
         self._losses_bytes_per_step = pop * 4  # float32
-        param_count = sum(
-            v.size for v in jax.tree_util.tree_leaves(self._nodes[0].params)
-        )
-        self._params_bytes = param_count * 4  # float32
+        self._params_bytes = _param_tree_bytes(self._nodes[0].params)
 
     @property
     def nodes(self) -> list[ZeroGradNode]:
@@ -280,12 +298,5 @@ class ClusterZeroGrad:
         """
         if len(self._nodes) < 2:
             return True
-        ref_leaves = _numeric_param_leaves(self._nodes[0].params)
-        for node in self._nodes[1:]:
-            node_leaves = _numeric_param_leaves(node.params)
-            if len(ref_leaves) != len(node_leaves):
-                return False
-            for a, b in zip(ref_leaves, node_leaves):
-                if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
-                    return False
-        return True
+        ref = self._nodes[0].params
+        return all(_trees_close(ref, node.params, atol) for node in self._nodes[1:])

@@ -31,7 +31,6 @@ SPEC = VisionMlpSpec(
     lr=1e-2,  # ES pseudo-gradients need a higher LR than typical gradient training
     sigma=0.1,
     run_id="mnist-demo",
-    manifest_prefix="mnist",
 )
 
 

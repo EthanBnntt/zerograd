@@ -1,6 +1,5 @@
 """JAX + Optax primitives for zero-gradient evolutionary optimization."""
 
-from ._candidate import CandidateContext
 from ._cluster import ClusterZeroGrad, ZeroGradNode
 from ._distributed import (
     CalibrationResult,
@@ -52,7 +51,6 @@ from ._eggroll_h import (
 )
 
 __all__ = [
-    "CandidateContext",
     "CalibrationResult",
     "ClusterZeroGrad",
     "DeviceShard",

@@ -2,9 +2,8 @@
 
 ``train_mnist.py`` and `train_cifar10.py`` are thin wrappers around
 :func:`run` that only differ in dataset, dimensions, and a couple of
-hyperparameters (see issue #33-style duplication cleanup). Keeping one
-parameterized training loop here means fixes (checkpointing, early
-stopping, logging) land in both scripts at once.
+hyperparameters. Keeping one parameterized training loop here means fixes
+(checkpointing, early stopping, logging) land in both scripts at once.
 """
 
 from __future__ import annotations
@@ -17,8 +16,10 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 import optax
+from flax import nnx
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
+from zerograd import ZeroGrad
+from zerograd._nnx import params_pure_dict, update_params
 
 from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
 
@@ -36,52 +37,29 @@ class VisionMlpSpec:
     lr: float
     sigma: float
     run_id: str
-    manifest_prefix: str
     num_classes: int = 10
 
 
-def build_params(key: jax.Array, spec: VisionMlpSpec) -> dict:
-    """He-initialized ``input_dim -> hidden -> num_classes`` MLP parameters."""
-    k1, k2 = jax.random.fold_in(key, 1), jax.random.fold_in(key, 2)
-    w1 = jax.random.normal(k1, (spec.input_dim, spec.hidden)) * jnp.sqrt(2.0 / spec.input_dim)
-    b1 = jnp.zeros((spec.hidden,))
-    w2 = jax.random.normal(k2, (spec.hidden, spec.num_classes)) * jnp.sqrt(2.0 / spec.hidden)
-    b2 = jnp.zeros((spec.num_classes,))
-    return {
-        "layer1": {"weight": w1, "bias": b1},
-        "layer2": {"weight": w2, "bias": b2},
-    }
+class VisionMLP(nnx.Module):
+    """Flattened-image MLP: input_dim → hidden → num_classes."""
+
+    def __init__(self, input_dim: int, hidden: int, num_classes: int, *, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(input_dim, hidden, rngs=rngs)
+        self.l2 = nnx.Linear(hidden, num_classes, rngs=rngs)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.l2(nnx.relu(self.l1(x)))
 
 
-def build_manifest(spec: VisionMlpSpec) -> Manifest:
-    prefix = spec.manifest_prefix
-    return Manifest(
-        version=1,
-        entries=(
-            ManifestEntry(("layer1", "weight"), ParameterLayout.MATRIX, f"{prefix}_w1"),
-            ManifestEntry(("layer1", "bias"), ParameterLayout.VECTOR, f"{prefix}_b1"),
-            ManifestEntry(("layer2", "weight"), ParameterLayout.MATRIX, f"{prefix}_w2"),
-            ManifestEntry(("layer2", "bias"), ParameterLayout.VECTOR, f"{prefix}_b2"),
-        ),
-    )
-
-
-def model_loss(params, candidate, batch, rng):
-    del rng
+def model_loss(model: VisionMLP, batch) -> tuple[jax.Array, None]:
     x, y = batch
-    h = candidate.linear(params, ("layer1", "weight"), x)
-    h = h + candidate.vector(params, ("layer1", "bias"))
-    h = jnp.maximum(h, 0.0)  # ReLU
-    logits = candidate.linear(params, ("layer2", "weight"), h)
-    logits = logits + candidate.vector(params, ("layer2", "bias"))
+    logits = model(x)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     return jnp.mean(loss), None
 
 
-def evaluate(params, x, y):
-    h = jnp.maximum(x @ params["layer1"]["weight"] + params["layer1"]["bias"], 0.0)
-    logits = h @ params["layer2"]["weight"] + params["layer2"]["bias"]
-    preds = jnp.argmax(logits, axis=-1)
+def evaluate(model: VisionMLP, x, y) -> jax.Array:
+    preds = jnp.argmax(model(x), axis=-1)
     return jnp.mean(preds == y)
 
 
@@ -113,11 +91,11 @@ def run(spec: VisionMlpSpec, args: argparse.Namespace) -> None:
     y_test = jnp.array(y_test)
     print(f"  train: {x_train.shape}, test: {x_test.shape}")
 
-    key = jax.random.key(args.seed)
-    params = build_params(key, spec)
+    model = VisionMLP(
+        spec.input_dim, spec.hidden, spec.num_classes, rngs=nnx.Rngs(args.seed)
+    )
 
     optimizer = ZeroGrad(
-        build_manifest(spec),
         optax.adamw(learning_rate=spec.lr, weight_decay=0.0),
         population_size=32,
         rank=8,
@@ -128,12 +106,13 @@ def run(spec: VisionMlpSpec, args: argparse.Namespace) -> None:
     start_step = 0
     if args.resume:
         ck = load_checkpoint(args.resume)
-        params = ck["params"]
+        state = optimizer.init(model)
+        update_params(model, ck["params"])
         state = ck["state"]
         start_step = ck["step"] + 1
         print(f"Resumed from {args.resume} at step {start_step}")
     else:
-        state = optimizer.init(params)
+        state = optimizer.init(model)
 
     num_train = x_train.shape[0]
     es = EarlyStopping(patience=args.patience, mode="min") if args.early_stopping else None
@@ -141,15 +120,15 @@ def run(spec: VisionMlpSpec, args: argparse.Namespace) -> None:
 
     step = start_step
     for step in range(start_step, args.steps):
-        idx = jax.random.randint(jax.random.fold_in(key, step), (args.batch,), 0, num_train)
+        idx = jax.random.randint(jax.random.fold_in(jax.random.key(args.seed), step), (args.batch,), 0, num_train)
         batch = (x_train[idx], y_train[idx])
 
         t0 = time.time()
-        params, state, metrics = optimizer.step(state, params, batch, model_loss)
+        model, state, metrics = optimizer.step(state, model, batch, model_loss)
         dt = time.time() - t0
 
         if step % 20 == 0 or step == args.steps - 1:
-            test_acc = evaluate(params, x_test, y_test)
+            test_acc = evaluate(model, x_test, y_test)
             print(
                 f"gen {metrics.generation:3d}  "
                 f"mean_loss={metrics.mean_loss:.4f}  "
@@ -159,15 +138,15 @@ def run(spec: VisionMlpSpec, args: argparse.Namespace) -> None:
             )
 
         if args.checkpoint and (step + 1) % args.checkpoint_interval == 0:
-            save_checkpoint(args.checkpoint, step, params, state)
+            save_checkpoint(args.checkpoint, step, params_pure_dict(model), state)
             print(f"  checkpoint saved: {args.checkpoint}")
         if es is not None and es(float(metrics.mean_loss)):
             print(f"Early stopping at step {step}: loss plateaued for {args.patience} steps.")
             break
 
-    print(f"\nFinal test accuracy: {float(evaluate(params, x_test, y_test)):.1%}")
+    print(f"\nFinal test accuracy: {float(evaluate(model, x_test, y_test)):.1%}")
     if args.checkpoint:
-        save_checkpoint(args.checkpoint, step, params, state)
+        save_checkpoint(args.checkpoint, step, params_pure_dict(model), state)
 
 
 def main(spec: VisionMlpSpec) -> None:

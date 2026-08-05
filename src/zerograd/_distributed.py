@@ -22,17 +22,18 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence, TypeVar
+from typing import Any, Callable, Sequence, TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 
-from ._manifest import ParameterTree
 from ._nnx import params_pure_dict, update_params
-from ._optimizer import LossFn, ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
+from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
+Device: TypeAlias = Any  # jax.Device is nanobind; not usable in type expressions
 
 _T = TypeVar("_T")
 _R = TypeVar("_R")
@@ -72,7 +73,7 @@ class ShardResult:
 class CalibrationResult:
     """Per-device timing from auto-calibration."""
 
-    device: jax.Device
+    device: Device
     name: str
     num_candidates: int
     elapsed_seconds: float
@@ -112,6 +113,15 @@ def compute_partition_sizes(population: int, weights: list[float]) -> list[int]:
     return sizes
 
 
+def split_candidate_ids(population: int, sizes: Sequence[int]) -> list[Array]:
+    """Split ``0..population-1`` into contiguous shards matching ``sizes``."""
+    all_ids = jnp.arange(population, dtype=jnp.int32)
+    if len(sizes) <= 1:
+        return [all_ids]
+    split_points = jnp.cumsum(jnp.asarray(sizes[:-1]))
+    return list(jnp.split(all_ids, split_points))
+
+
 class DeviceShard:
     """Evaluate a population shard on a specific JAX device.
 
@@ -124,9 +134,9 @@ class DeviceShard:
 
     def __init__(
         self,
-        device: jax.Device,
+        device: Device,
         optimizer: ZeroGrad,
-        loss_fn: LossFn | ModelLossFn,
+        loss_fn: ModelLossFn,
         name: str = "",
     ) -> None:
         self.device = device
@@ -147,8 +157,6 @@ class DeviceShard:
             rng = jax.random.key(0)
 
         # NNX modules are not device_put-friendly as a whole; put batch/ids only.
-        from flax import nnx
-
         if isinstance(params, nnx.Module):
             batch_d = jax.device_put(batch, self.device)
             ids_d = jax.device_put(candidate_ids, self.device)
@@ -204,10 +212,10 @@ class DistributedZeroGrad:
     def __init__(
         self,
         optimizer: ZeroGrad,
-        devices: list[jax.Device],
-        loss_fn: LossFn | ModelLossFn,
+        devices: list[Device],
+        loss_fn: ModelLossFn,
         weights: list[float] | None = None,
-        coordinator_device: jax.Device | None = None,
+        coordinator_device: Device | None = None,
     ) -> None:
         if not devices:
             raise ValueError("at least one device is required")
@@ -262,14 +270,10 @@ class DistributedZeroGrad:
 
     def _apply_partition(self) -> None:
         """Split candidate IDs according to current partition sizes and assign to shards."""
-        all_ids = jnp.arange(self._optimizer.population_size, dtype=jnp.int32)
-        sizes = self._partition_sizes
-
-        # Build split points (cumulative sum, excluding last element)
-        split_points = jnp.cumsum(jnp.array(sizes[:-1])) if len(sizes) > 1 else []
-        id_shards = jnp.split(all_ids, split_points) if len(sizes) > 1 else [all_ids]
-
-        for shard, ids in zip(self._shards, id_shards):
+        for shard, ids in zip(
+            self._shards,
+            split_candidate_ids(self._optimizer.population_size, self._partition_sizes),
+        ):
             shard._candidate_ids = ids
 
     def init(self, model_or_params: Any) -> ZeroGradState:
@@ -297,7 +301,9 @@ class DistributedZeroGrad:
         gen = state.generation
 
         def _evaluate(shard: DeviceShard) -> Array:
-            result = shard.evaluate(model_or_params, batch, shard._candidate_ids, gen, rng)
+            candidate_ids = shard._candidate_ids
+            assert candidate_ids is not None
+            result = shard.evaluate(model_or_params, batch, candidate_ids, gen, rng)
             return jax.device_put(result.losses, self._coordinator_device)
 
         def _shard_is_empty(shard: DeviceShard) -> bool:
@@ -313,8 +319,6 @@ class DistributedZeroGrad:
             concat=jnp.concatenate,
             is_empty=_shard_is_empty,
         )
-
-        from flax import nnx
 
         if isinstance(model_or_params, nnx.Module):
             return self._optimizer.step_from_losses(state, model_or_params, losses)
@@ -386,7 +390,7 @@ class DistributedZeroGrad:
 
 @dataclass(slots=True)
 class _DeviceReplica:
-    device: jax.Device
+    device: Device
     optimizer: ZeroGrad
     model: Any
     state: ZeroGradState
@@ -406,10 +410,10 @@ class ReplicatedDistributedZeroGrad:
     def __init__(
         self,
         *,
-        devices: list[jax.Device],
+        devices: list[Device],
         optimizer_factory: Callable[[], ZeroGrad],
         model_factory: Callable[[], Any],
-        loss_fn: LossFn | ModelLossFn,
+        loss_fn: ModelLossFn,
         weights: list[float] | None = None,
     ) -> None:
         if not devices:
@@ -555,7 +559,7 @@ class ReplicatedDistributedZeroGrad:
         return self._replicas[0].state
 
     @property
-    def devices(self) -> list[jax.Device]:
+    def devices(self) -> list[Device]:
         return list(self._devices)
 
     @property

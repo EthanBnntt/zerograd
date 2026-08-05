@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from zerograd import (
-    CandidateContext,
     Manifest,
     ManifestEntry,
     ParameterLayout,
@@ -14,6 +13,13 @@ from zerograd import (
     shape_centered_loss,
     validate_losses,
 )
+from zerograd._candidate import (
+    perturbed_linear,
+    perturbed_table_lookup,
+    perturbed_tied_logits,
+    perturbed_vector,
+)
+from zerograd._factors import matrix_factors, scaled_factor, table_factors, vector_noise
 
 
 def _make_params():
@@ -92,10 +98,8 @@ class TestCandidateForward:
         key = jax.random.key(42)
         rank, sigma = 2, 0.1
         x = jax.random.normal(jax.random.key(1), (3, 8))
-        ctx = CandidateContext(manifest, key, rank, sigma)
-        y = ctx.linear(params, ("linear", "weight"), x)
-        from zerograd._factors import matrix_factors, scaled_factor
         gk = group_key(key, manifest, "linear")
+        y = perturbed_linear(x, params["linear"]["weight"], gk, rank, sigma)
         a, b = matrix_factors(gk, (8, 4), rank, dtype=jnp.float32)
         y_dense = x @ params["linear"]["weight"] + scaled_factor(rank, sigma, jnp.float32) * ((x @ a) @ b)
         np.testing.assert_allclose(np.asarray(y), np.asarray(y_dense), rtol=1e-5, atol=1e-5)
@@ -106,10 +110,8 @@ class TestCandidateForward:
         key = jax.random.key(42)
         rank, sigma = 2, 0.1
         indices = jnp.array([0, 3, 7])
-        ctx = CandidateContext(manifest, key, rank, sigma)
-        y = ctx.table_lookup(params, ("table", "embed"), indices)
-        from zerograd._factors import table_factors, scaled_factor
         gk = group_key(key, manifest, "embed")
+        y = perturbed_table_lookup(params["table"]["embed"], indices, gk, rank, sigma)
         a, b = table_factors(gk, (16, 4), rank, dtype=jnp.float32)
         y_dense = params["table"]["embed"][indices] + scaled_factor(rank, sigma, jnp.float32) * jnp.einsum("...r,cr->...c", a[indices], b)
         np.testing.assert_allclose(np.asarray(y), np.asarray(y_dense), rtol=1e-5, atol=1e-5)
@@ -120,10 +122,8 @@ class TestCandidateForward:
         key = jax.random.key(42)
         rank, sigma = 2, 0.1
         x = jax.random.normal(jax.random.key(1), (3, 4))
-        ctx = CandidateContext(manifest, key, rank, sigma)
-        logits = ctx.tied_logits(params, ("table", "embed"), x)
-        from zerograd._factors import table_factors, scaled_factor
         gk = group_key(key, manifest, "embed")
+        logits = perturbed_tied_logits(x, params["table"]["embed"], gk, rank, sigma)
         a, b = table_factors(gk, (16, 4), rank, dtype=jnp.float32)
         y_dense = x @ params["table"]["embed"].T + scaled_factor(rank, sigma, jnp.float32) * jnp.einsum("...c,cr,vr->...v", x, b, a)
         np.testing.assert_allclose(np.asarray(logits), np.asarray(y_dense), rtol=1e-5, atol=1e-5)
@@ -133,20 +133,11 @@ class TestCandidateForward:
         manifest = _make_manifest()
         key = jax.random.key(42)
         sigma = 0.1
-        ctx = CandidateContext(manifest, key, 1, sigma)
-        v = ctx.vector(params, ("vector", "scale"))
-        from zerograd._factors import vector_noise, scaled_factor
         gk = group_key(key, manifest, "scale")
+        v = perturbed_vector(params["vector"]["scale"], gk, sigma)
         noise = vector_noise(gk, (4,), dtype=jnp.float32)
         v_dense = params["vector"]["scale"] + scaled_factor(1, sigma, jnp.float32) * noise
         np.testing.assert_allclose(np.asarray(v), np.asarray(v_dense), rtol=1e-5, atol=1e-5)
-
-    def test_layout_mismatch_rejected(self):
-        params = _make_params()
-        manifest = _make_manifest()
-        ctx = CandidateContext(manifest, jax.random.key(0), 2, 0.1)
-        with pytest.raises(ValueError):
-            ctx.linear(params, ("table", "embed"), jnp.ones((3, 16)))
 
 
 class TestFitness:

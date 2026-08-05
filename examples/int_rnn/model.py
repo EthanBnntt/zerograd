@@ -627,7 +627,7 @@ def lut_stats(model: IntRnnLM) -> tuple[int, float]:
 
 def count_params(model: nnx.Module) -> int:
     """Count ``nnx.Param`` leaves (ES-trainable, including tied embed)."""
-    leaves = jax.tree.leaves(nnx.state(model, nnx.Param).to_pure_dict())
+    leaves = jax.tree.leaves(nnx.to_pure_dict(nnx.state(model, nnx.Param)))
     return int(sum(v.size for v in leaves))
 
 

@@ -22,7 +22,8 @@ import jax.numpy as jnp
 import optax
 
 from zerograd import ClusterZeroGrad, ZeroGrad
-from _xor_model import XOR_X, XOR_Y, accuracy, build_manifest, build_params, loss_fn
+from zerograd._nnx import params_pure_dict
+from _xor_model import XOR_X, XOR_Y, accuracy, build_model, loss_fn
 
 
 def main():
@@ -36,10 +37,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    manifest = build_manifest()
-
     optimizer = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=args.lr, weight_decay=0.0),
         population_size=args.pop,
         rank=args.rank,
@@ -50,7 +48,7 @@ def main():
 
     cluster = ClusterZeroGrad(
         optimizer,
-        build_params,
+        build_model,
         loss_fn,
         seed=args.seed,
         num_nodes=args.nodes,
@@ -75,7 +73,6 @@ def main():
     # ── Baseline: single-node ──────────────────────────────────────────────────
     print("Running single-node baseline...")
     opt_single = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=args.lr, weight_decay=0.0),
         population_size=args.pop,
         rank=args.rank,
@@ -83,38 +80,33 @@ def main():
         seed=args.seed,
         run_id="cluster-xor",
     )
-    params_single = build_params(jax.random.key(args.seed))
-    state_single = opt_single.init(params_single)
+    model_single = build_model(jax.random.key(args.seed))
+    state_single = opt_single.init(model_single)
     for step in range(args.steps):
-        params_single, state_single, _ = opt_single.step(
-            state_single, params_single, batch, loss_fn)
-    # Report the actual XOR MSE of the baseline model. (Previously this printed
-    # mean(w1**2), which is unrelated to model performance — see issue #20.)
-    _h = jax.nn.tanh(XOR_X @ params_single["w1"]) + params_single["b1"]
-    _logits = _h @ params_single["w2"] + params_single["b2"]
-    baseline_loss = float(jnp.mean((_logits - XOR_Y) ** 2))
+        model_single, state_single, _ = opt_single.step(
+            state_single, model_single, batch, loss_fn)
+    baseline_loss = float(jnp.mean((model_single(XOR_X) - XOR_Y) ** 2))
     print(f"  Baseline final loss: {baseline_loss:.4f}\n")
 
     # ── Cluster ─────────────────────────────────────────────────────────────────
     print("Running cluster...")
     t0 = time.time()
     for step in range(args.steps):
-        params, state, metrics = cluster.step(batch)
+        model, state, metrics = cluster.step(batch)
         synced = cluster.verify_sync()
 
         if step % 50 == 0 or step == args.steps - 1:
-            acc = accuracy(params)
+            acc = accuracy(model)
             print(f"  gen {metrics.generation:3d}  loss={metrics.mean_loss:.4f}  "
                   f"acc={acc:.0%}  sync={'✓' if synced else '✗'}  "
                   f"({(time.time() - t0) / (step + 1):.3f}s/step)")
 
     # ── Verification ────────────────────────────────────────────────────────────
     final_synced = cluster.verify_sync()
-    acc = accuracy(params)
+    acc = accuracy(model)
 
-    # Check cluster matches single-node baseline
-    cluster_leaves = jax.tree_util.tree_leaves(params)
-    single_leaves = jax.tree_util.tree_leaves(params_single)
+    cluster_leaves = jax.tree_util.tree_leaves(params_pure_dict(model))
+    single_leaves = jax.tree_util.tree_leaves(params_pure_dict(model_single))
     max_diff = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(cluster_leaves, single_leaves))
 
     print(f"\n{'=' * 60}")

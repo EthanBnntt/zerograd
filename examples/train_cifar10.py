@@ -38,7 +38,6 @@ SPEC = VisionMlpSpec(
     lr=5e-3,  # ES pseudo-gradients need a higher LR than typical gradient training
     sigma=0.02,  # lower than MNIST — 3072-dim inputs amplify perturbation noise
     run_id="cifar-demo",
-    manifest_prefix="cifar",
 )
 
 

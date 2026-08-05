@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from zerograd import CandidateContext, Manifest, ManifestEntry, ParameterLayout
+from zerograd import group_key, Manifest, ManifestEntry, ParameterLayout
 from zerograd._candidate import (
     perturbed_linear,
     perturbed_table_lookup,
@@ -19,14 +19,6 @@ def _manifest():
         ManifestEntry(("t",), ParameterLayout.TABLE, "t"),
         ManifestEntry(("v",), ParameterLayout.VECTOR, "v"),
     ))
-
-
-def _params():
-    return {
-        "m": jnp.ones((8, 4)),
-        "t": jnp.ones((16, 4)),
-        "v": jnp.ones((4,)),
-    }
 
 
 class TestForwardShapeValidation:
@@ -56,61 +48,33 @@ class TestForwardShapeValidation:
             perturbed_vector(jnp.ones((4, 4)), jax.random.key(0), 0.1)
 
 
-class TestCandidateContextLayoutMismatch:
-    def _ctx(self):
-        return CandidateContext(_manifest(), jax.random.key(0), 2, 0.1)
-
-    def test_linear_rejects_non_matrix_entry(self):
-        ctx = self._ctx()
-        with pytest.raises(ValueError):
-            ctx.linear(_params(), ("t",), jnp.ones((3, 16)))
-
-    def test_table_lookup_rejects_non_table_entry(self):
-        ctx = self._ctx()
-        with pytest.raises(ValueError):
-            ctx.table_lookup(_params(), ("m",), jnp.array([0, 1]))
-
-    def test_tied_logits_rejects_non_table_entry(self):
-        ctx = self._ctx()
-        with pytest.raises(ValueError):
-            ctx.tied_logits(_params(), ("m",), jnp.ones((3, 4)))
-
-    def test_vector_rejects_non_vector_entry(self):
-        ctx = self._ctx()
-        with pytest.raises(ValueError):
-            ctx.vector(_params(), ("t",))
-
-
-class TestCandidateContextForwardResults:
+class TestPerturbedForwardResults:
     def test_linear_preserves_output_shape(self):
-        ctx = CandidateContext(_manifest(), jax.random.key(1), 2, 0.1)
-        x = jnp.ones((3, 8))
-        y = ctx.linear(_params(), ("m",), x)
+        y = perturbed_linear(
+            jnp.ones((3, 8)), jnp.ones((8, 4)), jax.random.key(1), 2, 0.1
+        )
         assert y.shape == (3, 4)
 
     def test_table_lookup_preserves_output_shape(self):
-        ctx = CandidateContext(_manifest(), jax.random.key(1), 2, 0.1)
         indices = jnp.array([0, 3, 7, 15])
-        y = ctx.table_lookup(_params(), ("t",), indices)
+        y = perturbed_table_lookup(jnp.ones((16, 4)), indices, jax.random.key(1), 2, 0.1)
         assert y.shape == (4, 4)
 
     def test_tied_logits_preserves_output_shape(self):
-        ctx = CandidateContext(_manifest(), jax.random.key(1), 2, 0.1)
-        x = jnp.ones((5, 4))
-        y = ctx.tied_logits(_params(), ("t",), x)
+        y = perturbed_tied_logits(
+            jnp.ones((5, 4)), jnp.ones((16, 4)), jax.random.key(1), 2, 0.1
+        )
         assert y.shape == (5, 16)
 
     def test_vector_preserves_output_shape(self):
-        ctx = CandidateContext(_manifest(), jax.random.key(1), 1, 0.1)
-        v = ctx.vector(_params(), ("v",))
+        v = perturbed_vector(jnp.ones((4,)), jax.random.key(1), 0.1)
         assert v.shape == (4,)
 
-    def test_key_for_is_deterministic(self):
+    def test_group_key_is_deterministic(self):
         manifest = _manifest()
-        ctx = CandidateContext(manifest, jax.random.key(7), 2, 0.1)
-        k1 = ctx.key_for(("m",))
-        k2 = ctx.key_for(("m",))
+        key = jax.random.key(7)
+        k1 = group_key(key, manifest, "m")
+        k2 = group_key(key, manifest, "m")
         assert jnp.array_equal(k1, k2)
-        # Different groups produce different keys.
-        k3 = ctx.key_for(("t",))
+        k3 = group_key(key, manifest, "t")
         assert not jnp.array_equal(k1, k3)

@@ -23,14 +23,9 @@ import time
 import jax
 import jax.numpy as jnp
 import optax
+from flax import nnx
 
-from zerograd import (
-    DistributedZeroGrad,
-    Manifest,
-    ManifestEntry,
-    ParameterLayout,
-    ZeroGrad,
-)
+from zerograd import DistributedZeroGrad, ZeroGrad
 
 # ── Model: 512→512→10 MLP (large enough for GPU to show advantage) ──────────
 INPUT_DIM = 512
@@ -38,46 +33,31 @@ HIDDEN_DIM = 512
 OUTPUT_DIM = 10
 
 
-def build_params(key):
-    k1, k2 = jax.random.split(key)
-    return {
-        "w1": jax.random.normal(k1, (INPUT_DIM, HIDDEN_DIM)) * 0.02,
-        "b1": jnp.zeros((HIDDEN_DIM,)),
-        "w2": jax.random.normal(k2, (HIDDEN_DIM, OUTPUT_DIM)) * 0.02,
-        "b2": jnp.zeros((OUTPUT_DIM,)),
-    }
+class BigMLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(INPUT_DIM, HIDDEN_DIM, rngs=rngs)
+        self.l2 = nnx.Linear(HIDDEN_DIM, OUTPUT_DIM, rngs=rngs)
+
+    def __call__(self, x):
+        return self.l2(nnx.relu(self.l1(x)))
 
 
-def build_manifest():
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w1",), ParameterLayout.MATRIX, "w1"),
-        ManifestEntry(("b1",), ParameterLayout.VECTOR, "b1"),
-        ManifestEntry(("w2",), ParameterLayout.MATRIX, "w2"),
-        ManifestEntry(("b2",), ParameterLayout.VECTOR, "b2"),
-    ))
-
-
-def loss_fn(params, candidate, batch, rng):
+def loss_fn(model, batch):
     x, y = batch
-    h = jax.nn.relu(candidate.linear(params, ("w1",), x))
-    h = h + candidate.vector(params, ("b1",))
-    logits = candidate.linear(params, ("w2",), h)
-    logits = logits + candidate.vector(params, ("b2",))
+    logits = model(x)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y)), None
 
 
-def run_experiment(name, optimizer, devices, loss_fn, params, batch, steps, weights=None, calibrate=False):
+def run_experiment(name, optimizer, devices, loss_fn, model, batch, steps, weights=None, calibrate=False):
     """Run one experiment configuration and report timing."""
     print(f"\n{'=' * 70}")
     print(f"  {name}")
     print(f"{'=' * 70}")
 
-    # Use the coordinator as a context manager so its ThreadPoolExecutor is
-    # always shut down, even if the run is interrupted (see issue #27).
     with DistributedZeroGrad(optimizer, devices, loss_fn, weights=weights) as dist_opt:
         if calibrate:
             print("  Calibrating devices...")
-            results = dist_opt.calibrate(params, batch, warmup=2, trials=3)
+            results = dist_opt.calibrate(model, batch, warmup=2, trials=3)
             for r in results:
                 print(f"    {r.name}: {r.per_candidate_seconds*1000:.2f}ms/candidate")
             print(f"    → weights={[f'{w:.1f}' for w in dist_opt.weights]}")
@@ -86,16 +66,16 @@ def run_experiment(name, optimizer, devices, loss_fn, params, batch, steps, weig
             print(f"  weights={dist_opt.weights}")
             print(f"  partition={dist_opt.partition_sizes}")
 
-        state = dist_opt.init(params)
+        state = dist_opt.init(model)
         t0 = time.time()
         for step in range(steps):
-            params, state, metrics = dist_opt.step(state, params, batch)
+            model, state, metrics = dist_opt.step(state, model, batch)
             if step % 20 == 0 or step == steps - 1:
                 print(f"    gen {metrics.generation:3d}  loss={metrics.mean_loss:.4f}  "
                       f"({(time.time() - t0) / (step + 1):.3f}s/step)")
         total = time.time() - t0
         print(f"    Total: {total:.1f}s ({total/steps:.3f}s/step)")
-    return total, params
+    return total, model
 
 
 def main():
@@ -113,8 +93,6 @@ def main():
     if gpus:
         gpu = gpus[0]
     else:
-        # No GPU available: fall back to CPU with a warning, instead of
-        # crashing with an unhelpful IndexError (see issue #28).
         print("Warning: no GPU found; falling back to CPU. The asymmetric "
               "compute demo is most meaningful with a GPU, but the protocol "
               "is device-agnostic.")
@@ -123,9 +101,7 @@ def main():
     print(f"Model: {INPUT_DIM}→{HIDDEN_DIM}→{OUTPUT_DIM}, pop={args.pop}, batch={args.batch}")
     print(f"Steps: {args.steps}")
 
-    key = jax.random.key(0)
-    params = build_params(key)
-    manifest = build_manifest()
+    model = BigMLP(nnx.Rngs(0))
     batch = (
         jax.random.normal(jax.random.key(1), (args.batch, INPUT_DIM)),
         jax.random.randint(jax.random.key(2), (args.batch,), 0, OUTPUT_DIM),
@@ -133,7 +109,6 @@ def main():
 
     def make_optimizer():
         return ZeroGrad(
-            manifest,
             optax.adamw(learning_rate=args.lr, weight_decay=0.0),
             population_size=args.pop,
             rank=args.rank,
@@ -142,30 +117,27 @@ def main():
             run_id="asymmetric",
         )
 
-    # ── 1. Even split (naive baseline) ─────────────────────────────────────────
+    # Fresh models per experiment so init/surgery stays independent.
     _, _ = run_experiment(
         "1. Even split (naive)",
         make_optimizer(), [cpu, gpu], loss_fn,
-        params, batch, args.steps,
+        BigMLP(nnx.Rngs(0)), batch, args.steps,
     )
 
-    # ── 2. Manual weights: CPU gets 1/5, GPU gets 4/5 ─────────────────────────
     _, _ = run_experiment(
         "2. Manual weights [1, 4] — GPU gets 4× more candidates",
         make_optimizer(), [cpu, gpu], loss_fn,
-        params, batch, args.steps,
+        BigMLP(nnx.Rngs(0)), batch, args.steps,
         weights=[1, 4],
     )
 
-    # ── 3. Auto-calibration ────────────────────────────────────────────────────
     _, _ = run_experiment(
         "3. Auto-calibrated weights",
         make_optimizer(), [cpu, gpu], loss_fn,
-        params, batch, args.steps,
+        BigMLP(nnx.Rngs(0)), batch, args.steps,
         calibrate=True,
     )
 
-    # ── Summary ────────────────────────────────────────────────────────────────
     print(f"\n{'=' * 70}")
     print("SUMMARY")
     print(f"{'=' * 70}")
@@ -187,7 +159,7 @@ For a 4× slow GPU + 1× fast GPU node:
 
 Or let calibration figure it out:
 
-    dist_opt.calibrate(params, batch)
+    dist_opt.calibrate(model, batch)
 """)
 
 

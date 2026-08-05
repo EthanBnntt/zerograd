@@ -20,7 +20,7 @@ import optax
 from flax import nnx
 
 from zerograd import IntLinear, ZeroGrad, ZgIntLinear
-from zerograd._integer import float_to_int, float_view_tree, snap_tree_to_integer
+from zerograd._integer import float_to_int, float_view_tree, int_relu, snap_tree_to_integer
 from zerograd._nnx import params_pure_dict
 
 
@@ -32,8 +32,6 @@ class IntMLP(nnx.Module):
         self.l2 = IntLinear(hidden, dout, act_dtype=jnp.int32, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        from zerograd._integer import int_relu
-
         h = int_relu(self.l1(x))
         return self.l2(h)
 

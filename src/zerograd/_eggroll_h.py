@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -125,7 +126,7 @@ def threshold_tree_for_manifest(
         for entry in manifest.entries
     }
 
-    def _build(node: ParameterTree | Array, path: tuple[str, ...]) -> ParameterTree | int:
+    def _build(node: ParameterTree | Array, path: tuple[str, ...]) -> Any:
         if isinstance(node, dict):
             return {k: _build(v, path + (k,)) for k, v in node.items()}
         if path in thr_by_path:
@@ -133,17 +134,17 @@ def threshold_tree_for_manifest(
         # Non-manifest leaf (should not be updated): impossible threshold.
         return 2**30
 
-    return _build(params, ())  # type: ignore[return-value]
+    return cast(ParameterTree, _build(params, ()))
 
 
 def apply_bin_updates(
-    params: Array | dict,
-    evidence: Array | dict,
-    threshold: int | Array | dict,
+    params: Array | ParameterTree,
+    evidence: Array | ParameterTree,
+    threshold: int | Array | ParameterTree,
     *,
     qmin: int | None = None,
     qmax: int | None = None,
-) -> Array | dict:
+) -> Array | ParameterTree:
     """Move each integer leaf by one discrete bin when ``|E| > threshold``.
 
     ``threshold`` may be a scalar (same bar for every leaf) or a pytree matching

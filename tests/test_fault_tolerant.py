@@ -6,41 +6,33 @@ import optax
 
 from zerograd import (
     FaultTolerantCluster,
-    Manifest,
-    ManifestEntry,
-    ParameterLayout,
     ZeroGrad,
 )
 
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
 
-def build_manifest():
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w1",), ParameterLayout.MATRIX, "w1"),
-        ManifestEntry(("b1",), ParameterLayout.VECTOR, "b1"),
-        ManifestEntry(("w2",), ParameterLayout.MATRIX, "w2"),
-        ManifestEntry(("b2",), ParameterLayout.VECTOR, "b2"),
-    ))
+from flax import nnx
+from zerograd._nnx import params_pure_dict
 
 
-def build_params(key):
-    k1, k2 = jax.random.split(key)
-    return {
-        "w1": jax.random.normal(k1, (4, 8)) * 0.1,
-        "b1": jnp.zeros((8,)),
-        "w2": jax.random.normal(k2, (8, 2)) * 0.1,
-        "b2": jnp.zeros((2,)),
-    }
+class TinyMLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(4, 8, rngs=rngs)
+        self.l2 = nnx.Linear(8, 2, rngs=rngs)
+
+    def __call__(self, x):
+        return self.l2(nnx.relu(self.l1(x)))
+
+
+def build_model(key):
+    return TinyMLP(nnx.Rngs(key))
 
 
 def make_loss_fn():
-    def loss_fn(params, candidate, batch, rng):
+    def loss_fn(model, batch):
         x, y = batch
-        h = jax.nn.relu(candidate.linear(params, ("w1",), x))
-        h = h + candidate.vector(params, ("b1",))
-        logits = candidate.linear(params, ("w2",), h)
-        logits = logits + candidate.vector(params, ("b2",))
+        logits = model(x)
         return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y)), None
     return loss_fn
 
@@ -54,7 +46,6 @@ def make_batch():
 
 def make_optimizer(pop=16, seed=42, run_id="ft-test"):
     return ZeroGrad(
-        build_manifest(),
         optax.adamw(1e-2),
         population_size=pop,
         rank=4,
@@ -67,13 +58,13 @@ def make_optimizer(pop=16, seed=42, run_id="ft-test"):
 def run_single_baseline(steps, seed=42, run_id="ft-test"):
     """Run single-node ZeroGrad for comparison."""
     opt = make_optimizer(seed=seed, run_id=run_id)
-    params = build_params(jax.random.key(seed))
-    state = opt.init(params)
+    model = build_model(jax.random.key(seed))
+    state = opt.init(model)
     batch = make_batch()
     loss_fn = make_loss_fn()
     for _ in range(steps):
-        params, state, _ = opt.step(state, params, batch, loss_fn)
-    return params
+        model, state, _ = opt.step(state, model, batch, loss_fn)
+    return model
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -86,7 +77,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=1)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=1)
         for _ in range(5):
             fc.step(batch)
 
@@ -99,14 +90,14 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=4)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=4)
         for _ in range(10):
             fc.step(batch)
 
         assert fc.verify_sync()
         # Rebuild baseline with pop=32
         opt2 = make_optimizer(pop=32)
-        params = build_params(jax.random.key(42))
+        params = build_model(jax.random.key(42))
         state = opt2.init(params)
         for _ in range(10):
             params, state, _ = opt2.step(state, params, batch, loss_fn)
@@ -118,7 +109,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=2)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=2)
 
         # Run 10 steps
         for _ in range(10):
@@ -132,14 +123,14 @@ class TestFaultTolerantCluster:
         # Late joiner's params should match
         # Rebuild with pop=32
         opt2 = make_optimizer(pop=32)
-        params = build_params(jax.random.key(42))
+        params = build_model(jax.random.key(42))
         state = opt2.init(params)
         for _ in range(10):
             params, state, _ = opt2.step(state, params, batch, loss_fn)
         late_params = fc.nodes[idx].params
         for a, b in zip(
-            jax.tree_util.tree_leaves(params),
-            jax.tree_util.tree_leaves(late_params),
+            jax.tree_util.tree_leaves(params_pure_dict(params)),
+            jax.tree_util.tree_leaves(params_pure_dict(late_params)),
         ):
             assert float(jnp.max(jnp.abs(a - b))) < 1e-5
 
@@ -149,7 +140,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=2)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=2)
         for _ in range(5):
             fc.step(batch)
 
@@ -167,7 +158,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=3)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=3)
         for _ in range(5):
             fc.step(batch)
 
@@ -192,7 +183,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=4)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=4)
         for _ in range(5):
             fc.step(batch)
 
@@ -212,7 +203,7 @@ class TestFaultTolerantCluster:
         opt = make_optimizer(pop=32)
         loss_fn = make_loss_fn()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=3)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=3)
         fc.set_weight(0, 1.0)
         fc.set_weight(1, 3.0)
         fc.set_weight(2, 1.0)
@@ -232,7 +223,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=2)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=2)
 
         # Step 0-4: normal
         for _ in range(5):
@@ -271,7 +262,7 @@ class TestFaultTolerantCluster:
 
         # Verify against baseline (25 total steps)
         opt2 = make_optimizer(pop=32)
-        params = build_params(jax.random.key(42))
+        params = build_model(jax.random.key(42))
         state = opt2.init(params)
         for _ in range(25):
             params, state, _ = opt2.step(state, params, batch, loss_fn)
@@ -284,7 +275,7 @@ class TestFaultTolerantCluster:
         batch = make_batch()
 
         fc = FaultTolerantCluster(
-            opt, build_params, loss_fn, seed=42, initial_nodes=1,
+            opt, build_model, loss_fn, seed=42, initial_nodes=1,
             max_loss_history=5,
         )
         for _ in range(10):
@@ -298,7 +289,7 @@ class TestFaultTolerantCluster:
         loss_fn = make_loss_fn()
         batch = make_batch()
 
-        fc = FaultTolerantCluster(opt, build_params, loss_fn, seed=42, initial_nodes=2)
+        fc = FaultTolerantCluster(opt, build_model, loss_fn, seed=42, initial_nodes=2)
         for _ in range(5):
             fc.step(batch)
 
@@ -313,7 +304,7 @@ class TestFaultTolerantCluster:
 
         # Verify it matches baseline
         opt2 = make_optimizer(pop=16)
-        params = build_params(jax.random.key(42))
+        params = build_model(jax.random.key(42))
         state = opt2.init(params)
         for _ in range(5):
             params, state, _ = opt2.step(state, params, batch, loss_fn)

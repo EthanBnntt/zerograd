@@ -6,7 +6,7 @@
 
 - **No objective gradients:** fitness-only Evolution Strategies primitives; arbitrary JAX-compatible objectives may be evaluated.
 - **No dense perturbation materialization:** candidate perturbations are PRNG-derived A/B low-rank factors, never materialized as dense matrices or tables during forward evaluation.
-- **Explicit manifest identity:** parameter layouts and tie groups are user-controlled, not inferred from PyTree leaf order.
+- **Manifest identity:** Flax NNX modules get layouts via graph surgery; dict params use an explicit `Manifest` (layouts and tie groups are never inferred from PyTree leaf order alone).
 - **Transactional lifecycle:** `init` / `step` return new state only after candidate evaluation, factor replay, and Optax application complete.
 
 ## Installation
@@ -16,48 +16,58 @@ uv sync
 uv pip install -e ".[dev]"
 ```
 
-## Quick start
+## Quick start (NNX)
+
+Build a normal Flax NNX module. `opt.init(model)` replaces layers with factor-aware ones and builds the manifest automatically; the loss sees the model under candidate perturbations.
 
 ```python
-import jax
 import jax.numpy as jnp
 import optax
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
+from flax import nnx
+from zerograd import ZeroGrad
 
-params = {
-    "embed": {"weight": jnp.ones((128, 32))},
-    "norm": {"scale": jnp.ones((32,))},
-    "head": {"weight": jnp.ones((32, 128))},
-}
-manifest = Manifest(
-    version=1,
-    entries=(
-        ManifestEntry(("embed", "weight"), ParameterLayout.TABLE, "token_embed"),
-        ManifestEntry(("norm", "scale"), ParameterLayout.VECTOR, "norm_scale"),
-        ManifestEntry(("head", "weight"), ParameterLayout.MATRIX, "head"),
-    ),
-)
-optimizer = ZeroGrad(
-    manifest,
-    optax.adamw(learning_rate=3e-4),
-    population_size=64,
-    rank=8,
-    sigma=0.01,
+class MLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(2, 16, rngs=rngs)
+        self.l2 = nnx.Linear(16, 1, rngs=rngs)
+
+    def __call__(self, x):
+        return self.l2(nnx.relu(self.l1(x)))
+
+model = MLP(nnx.Rngs(0))
+opt = ZeroGrad(
+    optax.adamw(1e-2, weight_decay=0.0),
+    population_size=32,
+    rank=4,
+    sigma=0.1,
     seed=0,
-    run_id="experiment-1",
+    run_id="xor",
 )
-state = optimizer.init(params)
+state = opt.init(model)
 
-def model_loss(params, candidate, batch, rng):
-    # Use candidate helpers — never receive a perturbed parameter tree
-    x = candidate.table_lookup(params, ("embed", "weight"), batch)
-    x = candidate.vector(params, ("norm", "scale")) * x  # simplified
-    logits = candidate.tied_logits(params, ("embed", "weight"), x)
-    return jnp.mean(logits ** 2), None
+def loss_fn(model, batch):
+    x, y = batch
+    logits = jnp.squeeze(model(x), -1)
+    return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, y.astype(jnp.float32))), None
 
-params, state, metrics = optimizer.step(state, params, jnp.array([0, 1, 2]), model_loss)
+x = jnp.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+y = jnp.array([0, 1, 1, 0])
+model, state, metrics = opt.step(state, model, (x, y), loss_fn)
 print(f"gen {metrics.generation}: mean_loss={metrics.mean_loss:.4f}")
 ```
+
+## Manifest (auto-built)
+
+`opt.init(model)` runs graph surgery and builds a `Manifest` automatically.
+Inspect it after init when you need layouts / tie groups:
+
+```python
+state = opt.init(model)
+print(opt.manifest.entries)
+```
+
+Dict params with an explicit `Manifest` remain supported for `init` /
+`step_from_losses` (custom evaluation). Prefer the NNX path for `step`.
 
 ## Distributed multi-device evaluation
 
@@ -65,17 +75,17 @@ The ES population is embarrassingly parallel — each candidate's loss is
 computed independently, and workers only share 1D fitness arrays.
 
 ```python
-from zerograd import DistributedZeroGrad
+from zerograd import DistributedZeroGrad, ZeroGrad
 
 cpu = jax.devices('cpu')[0]
 gpu = jax.devices('gpu')[0]
 
-opt = ZeroGrad(manifest, optax.adamw(1e-2), population_size=64, ...)
-dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=model_loss)
+opt = ZeroGrad(optax.adamw(1e-2), population_size=64, rank=4, sigma=0.1, seed=0, run_id="dist")
+dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn)
 
-state = dist_opt.init(params)
+state = dist_opt.init(model)
 for step in range(steps):
-    params, state, metrics = dist_opt.step(state, params, batch)
+    model, state, metrics = dist_opt.step(state, model, batch)
 ```
 
 Workers can be mixed across CPU and GPU, or multiple shards can share a
@@ -93,7 +103,7 @@ pass ``weights`` to assign more candidates to faster devices:
 dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn, weights=[1, 4])
 
 # Or auto-calibrate from measured device speed
-dist_opt.calibrate(params, batch)
+dist_opt.calibrate(model, batch)
 ```
 
 For custom multi-process setups, use `optimizer.evaluate_shard()` and

@@ -35,12 +35,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 
-from ._cluster import ParamsBuilder, ZeroGradNode, _numeric_param_leaves, evaluate_and_step
-from ._distributed import compute_partition_sizes
+from ._cluster import (
+    ParamsBuilder,
+    ZeroGradNode,
+    _param_tree_bytes,
+    _trees_close,
+    evaluate_and_step,
+)
+from ._distributed import compute_partition_sizes, split_candidate_ids
 from ._manifest import ParameterTree
-from ._optimizer import LossFn, StepMetrics, ZeroGrad, ZeroGradState
+from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
 
@@ -91,7 +96,7 @@ class FaultTolerantCluster:
         self,
         optimizer: ZeroGrad,
         build_params_fn: ParamsBuilder,
-        loss_fn: LossFn,
+        loss_fn: ModelLossFn,
         seed: int,
         initial_nodes: int = 1,
         max_loss_history: int = DEFAULT_MAX_LOSS_HISTORY,
@@ -214,26 +219,30 @@ class FaultTolerantCluster:
 
         weights = [s.weight for s in active]
         sizes = compute_partition_sizes(self._pop, weights)
-
-        all_ids = jnp.arange(self._pop, dtype=jnp.int32)
-        if len(sizes) > 1:
-            split_points = jnp.cumsum(jnp.array(sizes[:-1]))
-            id_shards = jnp.split(all_ids, split_points)
-        else:
-            id_shards = [all_ids]
-
-        for status, ids in zip(active, id_shards):
+        for status, ids in zip(active, split_candidate_ids(self._pop, sizes)):
             status._shard_ids = ids
 
     def _get_active_shards(self) -> list[tuple[NodeStatus, Array]]:
         """Return (status, candidate_ids) for all active nodes."""
         active = [s for s in self._statuses if s.active]
-        return [(s, s._shard_ids) for s in active]
+        out: list[tuple[NodeStatus, Array]] = []
+        for s in active:
+            ids = s._shard_ids
+            if ids is not None:
+                out.append((s, ids))
+        return out
 
     @property
     def partition_sizes(self) -> list[int]:
         """Candidate counts per active node."""
-        return [int(s._shard_ids.shape[0]) for s in self._statuses if s.active]
+        sizes: list[int] = []
+        for s in self._statuses:
+            if not s.active:
+                continue
+            ids = s._shard_ids
+            if ids is not None:
+                sizes.append(int(ids.shape[0]))
+        return sizes
 
     @property
     def num_active_nodes(self) -> int:
@@ -264,12 +273,9 @@ class FaultTolerantCluster:
 
     @property
     def params_bytes(self) -> int:
-        param_count = sum(
-            v.size for v in jax.tree_util.tree_leaves(
-                self._statuses[0].node.params
-            )
-        ) if self._statuses else 0
-        return param_count * 4
+        if not self._statuses:
+            return 0
+        return _param_tree_bytes(self._statuses[0].node.params)
 
     @property
     def nodes(self) -> list[ZeroGradNode]:
@@ -334,25 +340,13 @@ class FaultTolerantCluster:
         """Verify all nodes (active and paused) have identical params."""
         if len(self._statuses) < 2:
             return True
-        ref_leaves = _numeric_param_leaves(self._statuses[0].node.params)
-        for status in self._statuses[1:]:
-            node_leaves = _numeric_param_leaves(status.node.params)
-            if len(ref_leaves) != len(node_leaves):
-                return False
-            for a, b in zip(ref_leaves, node_leaves):
-                if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
-                    return False
-        return True
+        ref = self._statuses[0].node.params
+        return all(
+            _trees_close(ref, status.node.params, atol) for status in self._statuses[1:]
+        )
 
     def verify_against_single(
         self, params: ParameterTree, atol: float = 1e-5,
     ) -> bool:
         """Verify cluster params match an externally-computed baseline."""
-        ref_leaves = _numeric_param_leaves(params)
-        cluster_leaves = _numeric_param_leaves(self._statuses[0].node.params)
-        if len(ref_leaves) != len(cluster_leaves):
-            return False
-        for a, b in zip(ref_leaves, cluster_leaves):
-            if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
-                return False
-        return True
+        return _trees_close(params, self._statuses[0].node.params, atol)

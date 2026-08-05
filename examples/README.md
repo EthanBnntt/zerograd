@@ -126,12 +126,12 @@ from zerograd import ZeroGrad, DistributedZeroGrad
 cpu = jax.devices('cpu')[0]
 gpu = jax.devices('gpu')[0]
 
-opt = ZeroGrad(manifest, optax.adamw(1e-2), population_size=32, ...)
+opt = ZeroGrad(optax.adamw(1e-2), population_size=32, ...)
 dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn)
 
-state = dist_opt.init(params)
+state = dist_opt.init(model)
 for step in range(steps):
-    params, state, metrics = dist_opt.step(state, params, batch)
+    model, state, metrics = dist_opt.step(state, model, batch)
 ```
 
 For a 4× GPU node, pass all four GPU devices — each gets a quarter of the
@@ -158,7 +158,7 @@ Or let auto-calibration measure each device and set weights automatically:
 
 ```python
 dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn)
-results = dist_opt.calibrate(params, batch)  # times each device, sets weights
+results = dist_opt.calibrate(model, batch)  # times each device, sets weights
 print(dist_opt.weights)      # e.g. [1.0, 3.7]
 print(dist_opt.partition_sizes)  # e.g. [14, 50]
 ```

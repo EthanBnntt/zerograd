@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from zerograd import IntAffine
+from zerograd import IntAffine, IntEmbedding
 from zerograd._integer import (
     EGG_I8_MAX,
     EGG_I8_MIN,
@@ -53,8 +53,6 @@ class TestEggInteger:
         np.testing.assert_array_equal(np.asarray(affine(x)), np.asarray(x))
 
     def test_int_embedding_egg_init_and_lookup(self):
-        from zerograd import IntEmbedding
-
         emb = IntEmbedding(8, 4, rngs=nnx.Rngs(0))
         assert emb.embedding[...].dtype == jnp.int8
         assert int(emb.embedding[...].min()) >= EGG_I8_MIN
