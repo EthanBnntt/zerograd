@@ -63,6 +63,11 @@ def egg_init_matrix(key: Array, shape: tuple[int, ...]) -> Array:
     return egg_clip_cast(jnp.rint(w))
 
 
+def float_to_egg_i8(x: Array, *, scale: float = 16.0) -> Array:
+    """Fixed-scale float → EGG int8 (no per-tensor absmax blow-up)."""
+    return egg_clip_cast(jnp.rint(x.astype(jnp.float32) * float(scale)))
+
+
 def factor_compute_dtype(dtype: jnp.dtype) -> jnp.dtype:
     """ES factors stay float32 when the leaf is integer (cast-to-int8 destroys signal)."""
     if jnp.issubdtype(dtype, jnp.integer):
@@ -164,6 +169,36 @@ def float_to_int(x: Array, dtype: jnp.dtype = jnp.int8, *, bits: int | None = No
     max_abs = jnp.max(jnp.abs(x))
     scale = jnp.where(max_abs > 0, max_abs / qmax, jnp.asarray(1.0, x.dtype))
     return jnp.clip(jnp.rint(x / scale), qmin, qmax).astype(storage)
+
+
+def float_to_int4(x: Array) -> Array:
+    """Float → signed int4 stored in int8."""
+    return float_to_int(x, bits=4)
+
+
+def clip_int(x: Array, bits: int) -> Array:
+    """Clip an integer array into the signed ``bits`` range (int4 stored as int8)."""
+    qmin, qmax = qrange(bits)
+    storage = jnp.int8 if bits <= 8 else x.dtype
+    return jnp.clip(x.astype(jnp.int32), qmin, qmax).astype(storage)
+
+
+def requantize(
+    x: Array,
+    shift: int,
+    dtype: jnp.dtype = jnp.int8,
+    *,
+    bits: int | None = None,
+) -> Array:
+    """Right-shift int32 accumulator and clip into ``dtype`` / ``bits`` range."""
+    if bits is not None:
+        qmin, qmax = qrange(bits)
+        storage = jnp.int8 if bits <= 8 else dtype
+    else:
+        info = jnp.iinfo(dtype)
+        qmin, qmax = int(info.min), int(info.max)
+        storage = dtype
+    return jnp.clip(x.astype(jnp.int32) >> int(shift), qmin, qmax).astype(storage)
 
 
 def int_conv2d(
@@ -287,6 +322,12 @@ def int_matmul(lhs: Array, rhs: Array, *, accum: jnp.dtype = jnp.int32) -> Array
     return jnp.matmul(lhs, rhs, preferred_element_type=accum)
 
 
+def dyadic_mul(a: Array, b: Array, *, mult: int = 1, shift: int = 3, bits: int = 4) -> Array:
+    """Element-wise int product with dyadic rescaling: ``(a * b * mult) >> shift``."""
+    y = a.astype(jnp.int32) * b.astype(jnp.int32) * int(mult)
+    return requantize(y, shift, bits=bits)
+
+
 def int_relu(x: Array) -> Array:
     """Integer ReLU (keeps input dtype)."""
     return jnp.maximum(x, jnp.zeros((), dtype=x.dtype))
@@ -297,6 +338,74 @@ def int_mean(x: Array, axis: int = -1, keepdims: bool = True) -> Array:
     x32 = x.astype(jnp.int32)
     n = x32.shape[axis]
     return (jnp.sum(x32, axis=axis, keepdims=keepdims) // n).astype(x.dtype)
+
+
+# int4 GELU LUT for indices -8..7 (approx gelu mapped back into int4).
+_GELU_INT4_LUT = jnp.asarray(
+    [-8, -8, -7, -6, -4, -2, -1, 0, 0, 1, 2, 3, 4, 5, 6, 7],
+    dtype=jnp.int8,
+)
+
+
+def int_gelu_lut(x: Array, *, bits: int = 4) -> Array:
+    """GELU via LUT. For int4 inputs, indexes ``[-8, 7]`` → LUT."""
+    if bits == 4:
+        idx = jnp.clip(x.astype(jnp.int32) - INT4_MIN, 0, 15)
+        return _GELU_INT4_LUT[idx]
+    return int_relu(x)
+
+
+# Precomputed ≈1024 * exp(k/4) for k in [-32..0] (33 entries).
+_SOFTMAX_LUT = jnp.asarray(
+    [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        2,
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        13,
+        16,
+        21,
+        26,
+        33,
+        42,
+        54,
+        68,
+        86,
+        109,
+        139,
+        176,
+        223,
+        283,
+        359,
+        455,
+        577,
+        1024,
+    ],
+    dtype=jnp.int32,
+)
+
+
+def int_softmax(scores: Array, *, bits: int = 8) -> Array:
+    """Integer softmax via LUT on ``(x - max)`` clipped to ``[-32, 0]``."""
+    s32 = scores.astype(jnp.int32)
+    m = jnp.max(s32, axis=-1, keepdims=True)
+    z = jnp.clip(s32 - m, -32, 0)
+    idx = (z + 32).astype(jnp.int32)
+    exps = _SOFTMAX_LUT[idx]
+    total = jnp.sum(exps, axis=-1, keepdims=True)
+    total = jnp.maximum(total, 1)
+    return ((exps << bits) // total).astype(jnp.int16)
 
 
 def snap_tree_to_integer(

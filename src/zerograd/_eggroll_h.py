@@ -180,3 +180,20 @@ def apply_bin_updates(
         delta = step * mask
         return jnp.clip(params.astype(jnp.int32) + delta, lo, hi).astype(params.dtype)
     return params
+
+
+def apply_bin_updates_jit(
+    params: ParameterTree,
+    evidence: ParameterTree,
+    thresholds: ParameterTree,
+) -> ParameterTree:
+    """Bin-update an entire param tree as one fused XLA program (H100-friendly).
+
+    Equivalent to :func:`apply_bin_updates`; thresholds are folded as static
+    Python ints (not traced) so the jitted function only takes array args.
+    """
+
+    def _update(params_p, evidence_p):
+        return apply_bin_updates(params_p, evidence_p, thresholds)
+
+    return jax.jit(_update)(params, evidence)

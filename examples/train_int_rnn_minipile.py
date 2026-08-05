@@ -42,7 +42,7 @@ H100 efficiency notes:
       --steps 2000 --dim 2048 --heads 16 --layers 12 --seq-len 512 --ffn-mult 4 \\
       --batch 16 --population 256 --candidate-chunk 32 --ce-parallel 2 --rank 4 \\
       --sigma-shift 3 --update-alpha 0.02 --alpha-decay 0.001 \\
-      --delta-impl chunkwise --delta-chunk 64 --logit-chunk 12288
+      --delta-impl chunkwise --delta-chunk 64 --logit-chunk 12288 --gdn-feat-tile 32
 """
 
 from __future__ import annotations
@@ -230,6 +230,12 @@ def main():
         help="WY chunk length C (paper uses 64)",
     )
     parser.add_argument(
+        "--gdn-feat-tile",
+        type=int,
+        default=GDN_FEAT_TILE,
+        help="Feature tile for WY decay dots (default 32; lower uses less VRAM)",
+    )
+    parser.add_argument(
         "--prefetch",
         type=int,
         default=4,
@@ -339,6 +345,7 @@ def main():
     # (int_rnn.train_loop) observe the new values.
     rnn_train_loop.LOGIT_CHUNK = int(args.logit_chunk)
     rnn_model.DELTA_CHUNK = int(args.delta_chunk)
+    rnn_model.GDN_FEAT_TILE = max(1, int(args.gdn_feat_tile))
     rnn_train_loop.CE_PARALLEL = max(1, int(args.ce_parallel))
     chunk = resolve_candidate_chunk(args.candidate_chunk)
 
@@ -466,6 +473,7 @@ def main():
         "logit_chunk": rnn_train_loop.LOGIT_CHUNK,
         "delta_impl": args.delta_impl,
         "delta_chunk": rnn_model.DELTA_CHUNK,
+        "gdn_feat_tile": rnn_model.GDN_FEAT_TILE,
         "update": args.update,
         "update_alpha": args.update_alpha,
         "alpha_decay": args.alpha_decay,
