@@ -147,8 +147,7 @@ def apply_bin_updates(
     """Move each integer leaf by one discrete bin when ``|E| > threshold``.
 
     ``threshold`` may be a scalar (same bar for every leaf) or a pytree matching
-    ``params`` (from :func:`threshold_tree_for_manifest`). Use
-    :func:`apply_bin_updates_jit` for a single device program over big trees.
+    ``params`` (from :func:`threshold_tree_for_manifest`).
 
     Optional ``qmin``/``qmax`` override the dtype iinfo range (e.g. int4 in int8 storage).
     """
@@ -180,18 +179,3 @@ def apply_bin_updates(
         delta = step * mask
         return jnp.clip(params.astype(jnp.int32) + delta, lo, hi).astype(params.dtype)
     return params
-
-
-def apply_bin_updates_jit(
-    params: ParameterTree,
-    evidence: ParameterTree,
-    thresholds: ParameterTree,
-) -> ParameterTree:
-    """Bin-update an entire param tree as one fused XLA program (H100-friendly).
-
-    Equivalent to :func:`apply_bin_updates`; thresholds are folded as static
-    Python ints (not traced) so the jitted function only takes array args.
-    """
-    def _update(params_p, evidence_p):
-        return apply_bin_updates(params_p, evidence_p, thresholds)
-    return jax.jit(_update)(params, evidence)

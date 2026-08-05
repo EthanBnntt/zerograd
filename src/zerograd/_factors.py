@@ -44,11 +44,19 @@ def scaled_factor(rank: int, sigma: float, dtype: jnp.dtype) -> Array:
     return jnp.asarray(sigma / math.sqrt(rank), dtype=out_dtype)
 
 
-def matrix_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dtype) -> tuple[Array, Array]:
-    """Draw A[in, rank], B[rank, out] for a matrix leaf shaped [in, out]."""
+def _matrix_leaf_keys(
+    key: Array, shape: Sequence[int], rank: int
+) -> tuple[Array, Array, int, int]:
+    """Validate matrix shape/rank and split the PRNG key for A/B factors."""
     in_features, out_features = _validate_shape(shape, 2, "matrix shape")
     _validate_rank(rank)
     key_a, key_b = jax.random.split(key)
+    return key_a, key_b, in_features, out_features
+
+
+def matrix_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dtype) -> tuple[Array, Array]:
+    """Draw A[in, rank], B[rank, out] for a matrix leaf shaped [in, out]."""
+    key_a, key_b, in_features, out_features = _matrix_leaf_keys(key, shape, rank)
     # Draw in float32 so factor values are stable across forward/replay
     # regardless of the weight dtype a loss_fn may cast to (see issue #17:
     # jax.random.normal produces different values per dtype). Cast to the
@@ -65,9 +73,7 @@ def int_matrix_factors(key: Array, shape: Sequence[int], rank: int) -> tuple[Arr
     """Appendix H.1: int8 factors ``round(16·N(0,1))`` for a matrix leaf ``[in, out]``."""
     from ._eggroll_h import int8_from_normal
 
-    in_features, out_features = _validate_shape(shape, 2, "matrix shape")
-    _validate_rank(rank)
-    key_a, key_b = jax.random.split(key)
+    key_a, key_b, in_features, out_features = _matrix_leaf_keys(key, shape, rank)
     return (
         int8_from_normal(key_a, (in_features, rank)),
         int8_from_normal(key_b, (rank, out_features)),
@@ -115,11 +121,19 @@ def stacked_int_matrix_factors(
     return jax.vmap(one)(layer_ids)
 
 
-def table_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dtype) -> tuple[Array, Array]:
-    """Draw A[rows, rank], B[cols, rank] for a table leaf shaped [rows, cols]."""
+def _table_leaf_keys(
+    key: Array, shape: Sequence[int], rank: int
+) -> tuple[Array, Array, int, int]:
+    """Validate table shape/rank and split the PRNG key for A/B factors."""
     rows, columns = _validate_shape(shape, 2, "table shape")
     _validate_rank(rank)
     key_a, key_b = jax.random.split(key)
+    return key_a, key_b, rows, columns
+
+
+def table_factors(key: Array, shape: Sequence[int], rank: int, *, dtype: jnp.dtype) -> tuple[Array, Array]:
+    """Draw A[rows, rank], B[cols, rank] for a table leaf shaped [rows, cols]."""
+    key_a, key_b, rows, columns = _table_leaf_keys(key, shape, rank)
     # See matrix_factors: draw in float32 for dtype-stable parity, then cast.
     out_dtype = factor_compute_dtype(dtype)
     return (
@@ -136,24 +150,11 @@ def int_table_factors(key: Array, shape: Sequence[int], rank: int) -> tuple[Arra
     """
     from ._eggroll_h import int8_from_normal
 
-    rows, columns = _validate_shape(shape, 2, "table shape")
-    _validate_rank(rank)
-    key_a, key_b = jax.random.split(key)
+    key_a, key_b, rows, columns = _table_leaf_keys(key, shape, rank)
     return (
         int8_from_normal(key_a, (rows, rank)),
         int8_from_normal(key_b, (columns, rank)),
     )
-
-
-def int_table_factors_for_rows(
-    key: Array,
-    shape: Sequence[int],
-    rank: int,
-    row_ids: Array,
-) -> tuple[Array, Array]:
-    """``A[row_ids]`` via bulk ``int_table_factors`` then gather (exact match)."""
-    a, b = int_table_factors(key, shape, rank)
-    return a[jnp.asarray(row_ids, dtype=jnp.int32)], b
 
 
 def vector_noise(key: Array, shape: Sequence[int], *, dtype: jnp.dtype) -> Array:

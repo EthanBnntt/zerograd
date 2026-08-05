@@ -21,10 +21,10 @@ from zerograd import (
     ParameterLayout,
     ZeroGrad,
     candidate_key,
-    matrix_factors,
     shape_centered_loss,
     validate_losses,
 )
+from zerograd._factors import matrix_factors
 from zerograd._fault_tolerant import DEFAULT_MAX_LOSS_HISTORY
 
 

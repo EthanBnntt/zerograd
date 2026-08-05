@@ -22,8 +22,8 @@ uv pip install Pillow  # only for CIFAR-10 image loading
 | `train_mnist.py` | MNIST | 784→64→10 MLP | Real image classification |
 | `train_cifar10.py` | CIFAR-10 | 3072→128→10 MLP | Harder image classification |
 | `train_vit_cifar10.py` | CIFAR-10 | ViT (2L, 4H, d=64) | ZeroGrad vs AdamW, bf16 vs 4-bit QAT — see [findings](vit_findings.md) |
-| `train_distributed_cpu_gpu.py` | XOR gate (synthetic) | 2→16→1 MLP | Population split across **CPU + GPU** workers |
-| `train_distributed_dual_worker.py` | XOR gate (synthetic) | 2→16→1 MLP | Two workers on the **same GPU** |
+| `train_distributed_cpu_gpu.py` | XOR gate (synthetic) | 2→16→1 MLP | Population split across **CPU + GPU** workers (wraps `train_distributed_xor.py`) |
+| `train_distributed_dual_worker.py` | XOR gate (synthetic) | 2→16→1 MLP | Two workers on the **same GPU** (wraps `train_distributed_xor.py`) |
 | `train_distributed_asymmetric.py` | Synthetic (512→512→10) | MLP | **Asymmetric compute**: manual weights vs auto-calibration |
 | `train_cluster_seed_derived.py` | XOR gate (synthetic) | 2→16→1 MLP | **Seed-derived cluster**: params never communicated, only losses |
 | `train_cluster_multiprocess.py` | XOR gate (synthetic) | 2→16→1 MLP | **True multi-process**: 4 isolated processes, params verified identical |

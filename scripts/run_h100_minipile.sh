@@ -63,7 +63,6 @@ $PYTHON examples/train_int_rnn_minipile.py \
   --ce-parallel "${CE_PARALLEL:-2}" \
   --delta-impl chunkwise \
   --delta-chunk "${DELTA_CHUNK:-64}" \
-  --gdn-feat-tile "${GDN_FEAT_TILE:-32}" \
   --logit-chunk "${LOGIT_CHUNK:-12288}" \
   --tokenizer-mode "${TOKENIZER_MODE:-qwen}" \
   --prefetch 8 \

@@ -30,7 +30,7 @@ class TinyIntCnn(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
         self.conv = IntConv(1, 4, kernel_size=3, padding="SAME", rngs=rngs)
         self.act = IntLUT(init="identity", explore_shift=0, rngs=rngs)
-        self.head = IntLinear(4, 3, bits=8, act_dtype=jnp.int32, rngs=rngs)
+        self.head = IntLinear(4, 3, act_dtype=jnp.int32, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: int8 NHWC

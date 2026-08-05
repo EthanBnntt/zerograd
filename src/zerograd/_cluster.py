@@ -42,7 +42,7 @@ network cost. Compare to backprop's O(parameters) gradient sync.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -127,6 +127,41 @@ class ZeroGradNode:
     @property
     def seed(self) -> int:
         return self._seed
+
+
+def _numeric_param_leaves(tree: Any) -> list[Array]:
+    """Array leaves safe to subtract for sync checks (skip PRNG keys, etc.)."""
+    leaves: list[Array] = []
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.number):
+            leaves.append(leaf)
+    return leaves
+
+
+def evaluate_and_step(
+    shards: Sequence[tuple[ZeroGradNode, Array]],
+    step_nodes: Sequence[ZeroGradNode],
+    batch: Any,
+    *,
+    on_gathered: Callable[[Array], None] | None = None,
+) -> tuple[ParameterTree, ZeroGradState, StepMetrics]:
+    """Evaluate ``(node, candidate_ids)`` shards, gather losses, then step every node.
+
+    Shared by :class:`ClusterZeroGrad` and ``FaultTolerantCluster``: only the
+    concatenated loss array crosses node boundaries, and every node in
+    ``step_nodes`` independently derives the same deterministic update from
+    it. ``on_gathered`` lets a caller record the loss array (e.g. history for
+    late-joiner catch-up) before any node steps.
+    """
+    all_losses = [node.evaluate(batch, ids) for node, ids in shards]
+    gathered = jnp.concatenate(all_losses)
+    if on_gathered is not None:
+        on_gathered(gathered)
+    metrics = None
+    for node in step_nodes:
+        metrics = node.step(gathered)
+    ref = step_nodes[0]
+    return ref.params, ref.state, metrics
 
 
 class ClusterZeroGrad:
@@ -233,21 +268,8 @@ class ClusterZeroGrad:
         3. Each node independently calls step_from_losses.
         4. All nodes arrive at identical params.
         """
-        # 1. Each node evaluates its shard
-        all_losses = []
-        for node, ids in zip(self._nodes, self._shard_ids):
-            losses = node.evaluate(batch, ids)
-            all_losses.append(losses)
-
-        # 2. Gather losses — ONLY data crossing node boundaries
-        gathered = jnp.concatenate(all_losses)
-
-        # 3. Each node independently computes the same update
-        metrics = None
-        for node in self._nodes:
-            metrics = node.step(gathered)
-
-        return self._nodes[0].params, self._nodes[0].state, metrics
+        shards = list(zip(self._nodes, self._shard_ids))
+        return evaluate_and_step(shards, self._nodes, batch)
 
     def verify_sync(self, atol: float = 1e-5) -> bool:
         """Verify all nodes have identical params.
@@ -258,10 +280,12 @@ class ClusterZeroGrad:
         """
         if len(self._nodes) < 2:
             return True
-        ref_leaves = jax.tree_util.tree_leaves(self._nodes[0].params)
+        ref_leaves = _numeric_param_leaves(self._nodes[0].params)
         for node in self._nodes[1:]:
-            node_leaves = jax.tree_util.tree_leaves(node.params)
+            node_leaves = _numeric_param_leaves(node.params)
+            if len(ref_leaves) != len(node_leaves):
+                return False
             for a, b in zip(ref_leaves, node_leaves):
-                if float(jnp.max(jnp.abs(a - b))) > atol:
+                if a.shape != b.shape or float(jnp.max(jnp.abs(a - b))) > atol:
                     return False
         return True

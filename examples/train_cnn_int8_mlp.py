@@ -32,6 +32,7 @@ from zerograd._nnx import disable_candidates, params_pure_dict, update_params
 
 from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
 from _data import load_cifar10
+from _integer_es_cli import add_update_alpha_arg, require_even_population, resolve_candidate_chunk
 
 DEFAULT_STEPS = 200
 DEFAULT_BATCH = 128
@@ -62,10 +63,10 @@ class Int8CnnClassifier(nnx.Module):
         self.conv2 = IntConv(32, 64, kernel_size=3, rngs=rngs)
         self.act2 = IntLUT(init="identity", explore_shift=0, rngs=rngs)
         # 8×8×64 = 4096 after two stride-2 pools
-        self.fc = IntLinear(4096, 128, bits=8, rngs=rngs)
+        self.fc = IntLinear(4096, 128, rngs=rngs)
         self.act3 = IntLUT(init="identity", explore_shift=0, rngs=rngs)
         self.head = IntLinear(
-            128, NUM_CLASSES, bits=8, act_dtype=jnp.int32, rngs=rngs
+            128, NUM_CLASSES, act_dtype=jnp.int32, rngs=rngs
         )
 
     def __call__(self, images: jax.Array) -> jax.Array:
@@ -127,12 +128,7 @@ def main():
         default=2,
         help="Appendix H σ̂ (lower = larger int8 factor noise)",
     )
-    parser.add_argument(
-        "--update-alpha",
-        type=float,
-        default=0.12,
-        help="Fraction of int params eligible for ±1 bins (lower = gentler LUT)",
-    )
+    add_update_alpha_arg(parser)
     parser.add_argument(
         "--candidate-chunk",
         type=int,
@@ -148,10 +144,9 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
 
-    if args.population % 2 != 0:
-        raise SystemExit("--population must be even (integer_es antithetical pairs)")
+    require_even_population(args.population)
 
-    chunk = None if args.candidate_chunk == 0 else args.candidate_chunk
+    chunk = resolve_candidate_chunk(args.candidate_chunk)
 
     print(f"JAX devices: {jax.devices()}")
     print(f"Default backend: {jax.default_backend()}")
