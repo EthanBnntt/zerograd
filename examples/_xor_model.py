@@ -1,17 +1,17 @@
 """Shared XOR model definition for the XOR-based example scripts.
 
 Each training script keeps its own training loop; only the model definition
-(``build_params``, ``build_manifest``, ``loss_fn``, ``accuracy``) and the XOR
-dataset are shared here, to avoid copy-pasted boilerplate across the
-distributed and cluster XOR examples (see issue #30).
+(``build_model``, ``loss_fn``, ``accuracy``) and the XOR dataset are shared
+here, to avoid copy-pasted boilerplate across the distributed and cluster XOR
+examples.
 """
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
-from zerograd import Manifest, ManifestEntry, ParameterLayout
+import optax
+from flax import nnx
 
 # ── Model: 2→16→1 MLP on XOR ─────────────────────────────────────────────────
 INPUT_DIM = 2
@@ -23,40 +23,30 @@ XOR_X = jnp.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
 XOR_Y = jnp.array([[0.0], [1.0], [1.0], [0.0]])
 
 
-def build_params(key):
-    """2→16→1 MLP parameters drawn deterministically from ``key``."""
-    k1, k2 = jax.random.split(key)
-    return {
-        "w1": jax.random.normal(k1, (INPUT_DIM, HIDDEN_DIM)) * 0.5,
-        "b1": jnp.zeros((HIDDEN_DIM,)),
-        "w2": jax.random.normal(k2, (HIDDEN_DIM, OUTPUT_DIM)) * 0.5,
-        "b2": jnp.zeros((OUTPUT_DIM,)),
-    }
+class XorMLP(nnx.Module):
+    """2→16→1 tanh MLP for the XOR demos."""
+
+    def __init__(self, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(INPUT_DIM, HIDDEN_DIM, rngs=rngs)
+        self.l2 = nnx.Linear(HIDDEN_DIM, OUTPUT_DIM, rngs=rngs)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.l2(jnp.tanh(self.l1(x)))
 
 
-def build_manifest():
-    """Manifest for the 2→16→1 MLP parameter tree."""
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w1",), ParameterLayout.MATRIX, "w1"),
-        ManifestEntry(("b1",), ParameterLayout.VECTOR, "b1"),
-        ManifestEntry(("w2",), ParameterLayout.MATRIX, "w2"),
-        ManifestEntry(("b2",), ParameterLayout.VECTOR, "b2"),
-    ))
+def build_model(key: jax.Array) -> XorMLP:
+    """Deterministic XOR MLP from a PRNG key (seed-derived cluster builders)."""
+    return XorMLP(nnx.Rngs(key))
 
 
-def loss_fn(params, candidate, batch, rng):
-    """XOR mean-squared-error through a tanh MLP using candidate perturbations."""
+def loss_fn(model: XorMLP, batch) -> tuple[jax.Array, None]:
+    """XOR mean-squared-error through the tanh MLP."""
     x, y = batch
-    h = jax.nn.tanh(candidate.linear(params, ("w1",), x))
-    h = h + candidate.vector(params, ("b1",))
-    logits = candidate.linear(params, ("w2",), h)
-    logits = logits + candidate.vector(params, ("b2",))
-    return jnp.mean((logits - y) ** 2), None
+    return jnp.mean((model(x) - y) ** 2), None
 
 
-def accuracy(params):
-    """Fraction of XOR examples classified correctly by ``params``."""
-    h = jax.nn.tanh(XOR_X @ params["w1"]) + params["b1"]
-    logits = h @ params["w2"] + params["b2"]
+def accuracy(model: XorMLP) -> float:
+    """Fraction of XOR examples classified correctly by ``model``."""
+    logits = model(XOR_X)
     preds = (logits > 0.5).astype(jnp.float32)
     return float(jnp.mean(preds == XOR_Y))

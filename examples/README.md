@@ -27,8 +27,8 @@ uv pip install -e ".[rocm7,dev]"
 | `train_mnist.py` | MNIST | 784→64→10 MLP | Real image classification |
 | `train_cifar10.py` | CIFAR-10 | 3072→128→10 MLP | Harder image classification |
 | `train_vit_cifar10.py` | CIFAR-10 | ViT (2L, 4H, d=64) | ZeroGrad vs AdamW, bf16 vs 4-bit QAT — see [findings](vit_findings.md) |
-| `train_distributed_cpu_gpu.py` | XOR gate (synthetic) | 2→16→1 MLP | Population split across **CPU + GPU** workers |
-| `train_distributed_dual_worker.py` | XOR gate (synthetic) | 2→16→1 MLP | Two workers on the **same GPU** |
+| `train_distributed_cpu_gpu.py` | XOR gate (synthetic) | 2→16→1 MLP | Population split across **CPU + GPU** workers (wraps `train_distributed_xor.py`) |
+| `train_distributed_dual_worker.py` | XOR gate (synthetic) | 2→16→1 MLP | Two workers on the **same GPU** (wraps `train_distributed_xor.py`) |
 | `train_distributed_asymmetric.py` | Synthetic (512→512→10) | MLP | **Asymmetric compute**: manual weights vs auto-calibration |
 | `train_cluster_seed_derived.py` | XOR gate (synthetic) | 2→16→1 MLP | **Seed-derived cluster**: params never communicated, only losses |
 | `train_cluster_multiprocess.py` | XOR gate (synthetic) | 2→16→1 MLP | **True multi-process**: 4 isolated processes, params verified identical |
@@ -131,12 +131,12 @@ from zerograd import ZeroGrad, DistributedZeroGrad
 cpu = jax.devices('cpu')[0]
 gpu = jax.devices('gpu')[0]
 
-opt = ZeroGrad(manifest, optax.adamw(1e-2), population_size=32, ...)
+opt = ZeroGrad(optax.adamw(1e-2), population_size=32, ...)
 dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn)
 
-state = dist_opt.init(params)
+state = dist_opt.init(model)
 for step in range(steps):
-    params, state, metrics = dist_opt.step(state, params, batch)
+    model, state, metrics = dist_opt.step(state, model, batch)
 ```
 
 For a 4× GPU node, pass all four GPU devices — each gets a quarter of the
@@ -163,7 +163,7 @@ Or let auto-calibration measure each device and set weights automatically:
 
 ```python
 dist_opt = DistributedZeroGrad(opt, devices=[cpu, gpu], loss_fn=loss_fn)
-results = dist_opt.calibrate(params, batch)  # times each device, sets weights
+results = dist_opt.calibrate(model, batch)  # times each device, sets weights
 print(dist_opt.weights)      # e.g. [1.0, 3.7]
 print(dist_opt.partition_sizes)  # e.g. [14, 50]
 ```

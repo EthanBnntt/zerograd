@@ -1,7 +1,6 @@
 """JAX + Optax primitives for zero-gradient evolutionary optimization."""
 
-from ._candidate import CandidateContext, perturbed_int_linear, perturbed_linear, perturbed_table_lookup, perturbed_tied_logits, perturbed_vector
-from ._cluster import ClusterZeroGrad, ModelBuilder, ZeroGradNode
+from ._cluster import ClusterZeroGrad, ZeroGradNode
 from ._distributed import (
     CalibrationResult,
     DeviceShard,
@@ -11,7 +10,6 @@ from ._distributed import (
     compute_partition_sizes,
 )
 from ._fault_tolerant import FaultTolerantCluster, NodeStatus
-from ._factors import matrix_factors, scaled_factor, table_factors, vector_noise
 from ._fitness import shape_centered_loss, validate_losses
 from ._keys import candidate_key, group_key, step_key
 from ._manifest import Manifest, ManifestEntry, ParameterLayout, ParameterPath, ParameterTree
@@ -29,17 +27,17 @@ from ._integer import (
 from ._nnx import (
     IntAffine,
     IntConv,
+    IntEmbedding,
     IntLinear,
     IntLinearLUT,
     IntLUT,
-    IntSpatialProj,
     TernaryLinear,
     ZgConv,
     ZgEmbed,
     ZgIntConv,
+    ZgIntEmbedding,
     ZgIntLinear,
     ZgIntLUT,
-    ZgIntSpatialProj,
     ZgLayerNorm,
     ZgLinear,
     ZgTable,
@@ -50,16 +48,15 @@ from ._nnx import (
     mark_table,
 )
 from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
-from ._replay import replay, replay_entry, replay_integer
 from ._eggroll_h import (
     apply_bin_updates,
+    apply_bin_updates_jit,
     bin_update_threshold,
     shape_antithetical_loss,
     threshold_tree_for_manifest,
 )
 
 __all__ = [
-    "CandidateContext",
     "CalibrationResult",
     "ClusterZeroGrad",
     "DeviceShard",
@@ -67,13 +64,12 @@ __all__ = [
     "FaultTolerantCluster",
     "IntAffine",
     "IntConv",
+    "IntEmbedding",
     "IntLinear",
     "IntLinearLUT",
     "IntLUT",
-    "IntSpatialProj",
     "Manifest",
     "ManifestEntry",
-    "ModelBuilder",
     "ModelLossFn",
     "NodeStatus",
     "ParameterLayout",
@@ -86,9 +82,9 @@ __all__ = [
     "ZgConv",
     "ZgEmbed",
     "ZgIntConv",
+    "ZgIntEmbedding",
     "ZgIntLinear",
     "ZgIntLUT",
-    "ZgIntSpatialProj",
     "ZgLayerNorm",
     "ZgLinear",
     "ZgTable",
@@ -99,6 +95,7 @@ __all__ = [
     "ZeroGradSlot",
     "ZeroGradState",
     "apply_bin_updates",
+    "apply_bin_updates_jit",
     "apply_surgery",
     "bin_update_threshold",
     "threshold_tree_for_manifest",
@@ -115,20 +112,8 @@ __all__ = [
     "int_conv2d_flat",
     "int_matmul",
     "mark_table",
-    "matrix_factors",
-    "perturbed_int_linear",
-    "perturbed_linear",
-    "perturbed_table_lookup",
-    "perturbed_tied_logits",
-    "perturbed_vector",
-    "replay",
-    "replay_entry",
-    "replay_integer",
-    "scaled_factor",
     "shape_antithetical_loss",
     "shape_centered_loss",
     "step_key",
-    "table_factors",
     "validate_losses",
-    "vector_noise",
 ]

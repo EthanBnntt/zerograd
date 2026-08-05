@@ -16,54 +16,36 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import optax
+from flax import nnx
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
+from zerograd import ZeroGrad
 
 # ── Data ────────────────────────────────────────────────────────────────────
-# All four XOR rows, full-batch every step.
 X = jnp.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
 Y = jnp.array([0, 1, 1, 0])  # XOR truth table
 
-# ── Model ────────────────────────────────────────────────────────────────────
-# 2 → 16 → 1 MLP with ReLU hidden activation and sigmoid output.
+# ── Model: 2 → 16 → 1 MLP ────────────────────────────────────────────────────
 HIDDEN = 16
-key = jax.random.key(0)
-w1 = jax.random.normal(jax.random.fold_in(key, 1), (2, HIDDEN)) * 0.5
-b1 = jnp.zeros((HIDDEN,))
-w2 = jax.random.normal(jax.random.fold_in(key, 2), (HIDDEN, 1)) * 0.5
-b2 = jnp.zeros((1,))
-
-params = {
-    "layer1": {"weight": w1, "bias": b1},
-    "layer2": {"weight": w2, "bias": b2},
-}
-
-manifest = Manifest(
-    version=1,
-    entries=(
-        ManifestEntry(("layer1", "weight"), ParameterLayout.MATRIX, "xor_w1"),
-        ManifestEntry(("layer1", "bias"), ParameterLayout.VECTOR, "xor_b1"),
-        ManifestEntry(("layer2", "weight"), ParameterLayout.MATRIX, "xor_w2"),
-        ManifestEntry(("layer2", "bias"), ParameterLayout.VECTOR, "xor_b2"),
-    ),
-)
 
 
-def model_loss(params, candidate, batch, rng):
+class XorMLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(2, HIDDEN, rngs=rngs)
+        self.l2 = nnx.Linear(HIDDEN, 1, rngs=rngs)
+
+    def __call__(self, x):
+        return self.l2(nnx.relu(self.l1(x)))
+
+
+def model_loss(model, batch):
     x, y = batch
-    h = candidate.linear(params, ("layer1", "weight"), x)
-    h = h + candidate.vector(params, ("layer1", "bias"))
-    h = jnp.maximum(h, 0.0)  # ReLU
-    logits = candidate.linear(params, ("layer2", "weight"), h)
-    logits = logits + candidate.vector(params, ("layer2", "bias"))
-    logits = jnp.squeeze(logits, axis=-1)
+    logits = jnp.squeeze(model(x), -1)
     loss = optax.sigmoid_binary_cross_entropy(logits, y.astype(jnp.float32))
     return jnp.mean(loss), None
 
 
-# ── Optimizer ────────────────────────────────────────────────────────────────
+model = XorMLP(nnx.Rngs(0))
 optimizer = ZeroGrad(
-    manifest,
     optax.adamw(learning_rate=1e-2, weight_decay=0.0),
     population_size=32,
     rank=4,
@@ -71,19 +53,15 @@ optimizer = ZeroGrad(
     seed=0,
     run_id="xor-demo",
 )
+state = optimizer.init(model)
 
-state = optimizer.init(params)
-
-# ── Training loop ────────────────────────────────────────────────────────────
 NUM_STEPS = 500
 batch = (X, Y)
 
 for step in range(NUM_STEPS):
-    params, state, metrics = optimizer.step(state, params, batch, model_loss)
+    model, state, metrics = optimizer.step(state, model, batch, model_loss)
     if step % 50 == 0 or step == NUM_STEPS - 1:
-        # Evaluate current params (unperturbed) for accuracy
-        h = jnp.maximum(params["layer1"]["weight"].T @ X.T + params["layer1"]["bias"][:, None], 0.0)
-        logits = (params["layer2"]["weight"].T @ h).squeeze(0) + params["layer2"]["bias"][0]
+        logits = jnp.squeeze(model(X), -1)
         preds = (jax.nn.sigmoid(logits) > 0.5).astype(jnp.int32)
         acc = jnp.mean(preds == Y)
         print(
@@ -94,8 +72,10 @@ for step in range(NUM_STEPS):
         )
 
 print("\nFinal predictions:")
-h = jnp.maximum(params["layer1"]["weight"].T @ X.T + params["layer1"]["bias"][:, None], 0.0)
-logits = (params["layer2"]["weight"].T @ h).squeeze(0) + params["layer2"]["bias"][0]
+logits = jnp.squeeze(model(X), -1)
 probs = jax.nn.sigmoid(logits)
 for i in range(4):
-    print(f"  input={list(X[i])}  target={int(Y[i])}  prob={float(probs[i]):.3f}  pred={int(probs[i] > 0.5)}")
+    print(
+        f"  input={list(X[i])}  target={int(Y[i])}  "
+        f"prob={float(probs[i]):.3f}  pred={int(probs[i] > 0.5)}"
+    )

@@ -32,6 +32,18 @@ def _load_train_module():
     return module
 
 
+def _load_int_rnn_submodules(train):
+    """Import the ``int_rnn`` submodules whose globals ``train`` mutates.
+
+    Exec'ing ``train_int_rnn_minipile.py`` above adds ``examples/`` to
+    ``sys.path``, so the package is importable here as a side effect.
+    """
+    from int_rnn import model as rnn_model
+    from int_rnn import train_loop as rnn_train_loop
+
+    return rnn_model, rnn_train_loop
+
+
 def _ready(tree) -> None:
     jax.block_until_ready(tree)
 
@@ -51,10 +63,10 @@ def main() -> None:
     parser.add_argument("--ce-parallel", type=int, default=2)
     parser.add_argument("--logit-chunk", type=int, default=12_288)
     parser.add_argument("--delta-chunk", type=int, default=64)
-    parser.add_argument("--gdn-feat-tile", type=int, default=32)
     args = parser.parse_args()
 
     train = _load_train_module()
+    rnn_model, rnn_train_loop = _load_int_rnn_submodules(train)
     train.configure_architecture(
         dim=args.dim,
         heads=args.heads,
@@ -62,10 +74,12 @@ def main() -> None:
         ffn_mult=args.ffn_mult,
         seq_len=args.seq_len,
     )
-    train.LOGIT_CHUNK = args.logit_chunk
-    train.CE_PARALLEL = args.ce_parallel
-    train.DELTA_CHUNK = args.delta_chunk
-    train.GDN_FEAT_TILE = args.gdn_feat_tile
+    # Mutate the actual int_rnn submodule globals, not this snapshot of
+    # ``train`` — the mixer (int_rnn.model) and eval helpers
+    # (int_rnn.train_loop) read their own module's globals at call time.
+    rnn_train_loop.LOGIT_CHUNK = args.logit_chunk
+    rnn_train_loop.CE_PARALLEL = args.ce_parallel
+    rnn_model.DELTA_CHUNK = args.delta_chunk
 
     print(f"devices={jax.devices()} backend={jax.default_backend()}", flush=True)
     model = train.IntRnnLM(

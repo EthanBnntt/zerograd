@@ -1,0 +1,8 @@
+{
+  "include": ["src"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "typeCheckingMode": "standard",
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv"
+}

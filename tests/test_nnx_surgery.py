@@ -9,10 +9,13 @@ import pytest
 from flax import nnx
 
 from zerograd import (
+    ClusterZeroGrad,
+    IntEmbedding,
     IntLinear,
     ParameterLayout,
     ZeroGrad,
     ZgEmbed,
+    ZgIntEmbedding,
     ZgIntLinear,
     ZgLinear,
     ZgTable,
@@ -20,6 +23,7 @@ from zerograd import (
     apply_surgery,
     mark_table,
 )
+from zerograd._integer import float_to_int, int_relu
 from zerograd._nnx import params_pure_dict
 
 
@@ -71,6 +75,27 @@ class TestSurgery:
         assert isinstance(model.emb, ZgEmbed)
         assert any(e.layout is ParameterLayout.TABLE for e in manifest.entries)
 
+    def test_replaces_int_embedding(self):
+        class IntEmbedModel(nnx.Module):
+            def __init__(self, rngs: nnx.Rngs):
+                self.emb = IntEmbedding(16, 4, rngs=rngs)
+                self.head = IntLinear(4, 3, act_dtype=jnp.int32, rngs=rngs)
+
+            def __call__(self, idx):
+                return self.head(self.emb(idx))
+
+        model = IntEmbedModel(nnx.Rngs(0))
+        idx = jnp.arange(4, dtype=jnp.int32)
+        before = model(idx)
+        model, manifest = apply_surgery(model, rank=2, sigma=0.05, integer_es=True)
+        assert isinstance(model.emb, ZgIntEmbedding)
+        assert isinstance(model.head, ZgIntLinear)
+        assert ("emb", "embedding") in {e.path for e in manifest.entries}
+        assert any(e.layout is ParameterLayout.TABLE for e in manifest.entries)
+        model.zg_slot.enabled = False
+        after = model(idx)
+        assert jnp.array_equal(before, after)
+
     def test_wraps_bare_vector_and_marked_table(self):
         model = BareParamModel(nnx.Rngs(0))
         model, manifest = apply_surgery(model, rank=2, sigma=0.05)
@@ -113,8 +138,6 @@ class TestSurgery:
                 self.l2 = IntLinear(8, 1, rngs=rngs)
 
             def __call__(self, x):
-                from zerograd._integer import int_relu
-
                 return self.l2(int_relu(self.l1(x)))
 
         model = TinyInt(nnx.Rngs(0))
@@ -124,16 +147,10 @@ class TestSurgery:
         assert isinstance(model.l2, ZgIntLinear)
         assert any(e.layout is ParameterLayout.MATRIX for e in manifest.entries)
 
-        x = float_to_int_input(jnp.ones((4, 2)))
+        x = float_to_int(jnp.ones((4, 2)))
         model.zg_slot.enabled = False
         y = model(x)
         assert y.dtype == jnp.int8
-
-
-def float_to_int_input(x):
-    from zerograd._integer import float_to_int
-
-    return float_to_int(x)
 
 
 class TestNnxOptimizer:
@@ -197,11 +214,7 @@ class TestNnxOptimizer:
                 self.l2 = IntLinear(8, 1, rngs=rngs)
 
             def __call__(self, x):
-                from zerograd._integer import int_relu
-
                 return self.l2(int_relu(self.l1(x)))
-
-        from zerograd._integer import float_to_int
 
         model = TinyInt(nnx.Rngs(0))
         opt = ZeroGrad(
@@ -235,8 +248,6 @@ class TestNnxOptimizer:
 
 class TestNnxCluster:
     def test_cluster_stays_synced(self):
-        from zerograd import ClusterZeroGrad
-
         def build_model(key):
             return TinyMLP(nnx.Rngs(key))
 

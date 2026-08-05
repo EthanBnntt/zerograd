@@ -24,6 +24,10 @@ assert _spec is not None and _spec.loader is not None
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["train_int_rnn_minipile"] = _mod
 _spec.loader.exec_module(_mod)
+# Exec'ing the thin CLI module above adds ``examples/`` to ``sys.path``, so
+# the ``int_rnn`` package is importable here too; read the live GDN_FEAT_TILE
+# default straight from the model submodule instead of ``_mod``'s snapshot.
+from int_rnn import model as _rnn_model
 
 
 def _rand_q8(key, shape, *, gate: bool = False):
@@ -103,7 +107,7 @@ def bench_in_proj(batch: int, seq: int, dim: int, heads: int, reps: int = 5) -> 
 def main() -> None:
     print(
         f"devices={jax.devices()} backend={jax.default_backend()} "
-        f"feat_tile={_mod.GDN_FEAT_TILE}",
+        f"feat_tile={_rnn_model.GDN_FEAT_TILE}",
         flush=True,
     )
     bench_wy(bh=16 * 16, t=512, d=128, c=64, tile=32)

@@ -21,13 +21,16 @@ ViT: 4×4 patches (64+CLS=65 tokens), 2 layers, 4 heads, embed 64, MLP 128.
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import jax
 import jax.numpy as jnp
 import optax
+from flax import nnx
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
+from zerograd import ZeroGrad, mark_table
+from zerograd._nnx import params_pure_dict
 
 from _checkpoint import save_checkpoint
 from _data import load_cifar10
@@ -63,7 +66,6 @@ def quantize_4bit_ste(x: jax.Array) -> jax.Array:
     return x + jax.lax.stop_gradient(x_q - x)
 
 
-# ── Patch extraction ──────────────────────────────────────────────────────────
 def extract_patches(images: jax.Array) -> jax.Array:
     imgs = images.reshape(-1, IMG_SIZE, IMG_SIZE, 3)
     B = imgs.shape[0]
@@ -79,7 +81,78 @@ def layer_norm(x, scale, bias, eps=1e-5):
     return (x - mean) / jnp.sqrt(var + eps) * scale + bias
 
 
-# ── Parameter construction ────────────────────────────────────────────────────
+class VitBlock(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.q = nnx.Linear(EMBED_DIM, EMBED_DIM, use_bias=False, rngs=rngs)
+        self.k = nnx.Linear(EMBED_DIM, EMBED_DIM, use_bias=False, rngs=rngs)
+        self.v = nnx.Linear(EMBED_DIM, EMBED_DIM, use_bias=False, rngs=rngs)
+        self.o = nnx.Linear(EMBED_DIM, EMBED_DIM, use_bias=False, rngs=rngs)
+        self.mlp1 = nnx.Linear(EMBED_DIM, MLP_DIM, use_bias=False, rngs=rngs)
+        self.mlp2 = nnx.Linear(MLP_DIM, EMBED_DIM, use_bias=False, rngs=rngs)
+        self.ln1_scale = nnx.Param(jnp.ones((EMBED_DIM,)))
+        self.ln1_bias = nnx.Param(jnp.zeros((EMBED_DIM,)))
+        self.ln2_scale = nnx.Param(jnp.ones((EMBED_DIM,)))
+        self.ln2_bias = nnx.Param(jnp.zeros((EMBED_DIM,)))
+
+    def __call__(self, x, q):
+        B = x.shape[0]
+        residual = x
+        h = layer_norm(x, self.ln1_scale[...], self.ln1_bias[...])
+        q_proj = q(self.q(h))
+        k_proj = q(self.k(h))
+        v_proj = q(self.v(h))
+        qh = q_proj.reshape(B, NUM_TOKENS, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+        kh = k_proj.reshape(B, NUM_TOKENS, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+        vh = v_proj.reshape(B, NUM_TOKENS, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
+        attn = jax.nn.softmax(
+            jnp.einsum("bhnd,bhmd->bhnm", qh, kh) / jnp.sqrt(float(HEAD_DIM)), axis=-1)
+        attn_out = q(
+            self.o(
+                jnp.einsum("bhnm,bhmd->bhnd", attn, vh)
+                .transpose(0, 2, 1, 3)
+                .reshape(B, NUM_TOKENS, EMBED_DIM)
+            )
+        )
+        x = residual + attn_out
+        residual = x
+        h = layer_norm(x, self.ln2_scale[...], self.ln2_bias[...])
+        h = q(self.mlp1(h))
+        h = jax.nn.gelu(h)
+        h = q(self.mlp2(h))
+        return residual + h
+
+
+class TinyVit(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs, *, quantize: bool = False, bf16: bool = False):
+        self.patch_embed = nnx.Linear(PATCH_DIM, EMBED_DIM, use_bias=False, rngs=rngs)
+        self.cls_token = nnx.Param(jax.random.normal(rngs.params(), (EMBED_DIM,)) * 0.02)
+        self.pos_embed = mark_table(
+            nnx.Param(jax.random.normal(rngs.params(), (NUM_TOKENS, EMBED_DIM)) * 0.02)
+        )
+        self.blocks = nnx.List([VitBlock(rngs=rngs) for _ in range(NUM_LAYERS)])
+        self.ln_f_scale = nnx.Param(jnp.ones((EMBED_DIM,)))
+        self.ln_f_bias = nnx.Param(jnp.zeros((EMBED_DIM,)))
+        self.head = nnx.Linear(EMBED_DIM, NUM_CLASSES, rngs=rngs)
+        self.quantize = quantize
+        self.bf16 = bf16
+
+    def __call__(self, images):
+        q = quantize_4bit if self.quantize else (lambda x: x)
+        B = images.shape[0]
+        patches = extract_patches(images)
+        if self.bf16:
+            patches = patches.astype(jnp.bfloat16)
+        x = q(self.patch_embed(patches))
+        cls = jnp.broadcast_to(self.cls_token[...], (B, 1, EMBED_DIM))
+        x = jnp.concatenate([cls, x], axis=1)
+        x = x + q(self.pos_embed[jnp.arange(NUM_TOKENS)])
+        for block in self.blocks:
+            x = block(x, q)
+        x = layer_norm(x, self.ln_f_scale[...], self.ln_f_bias[...])
+        return self.head(x[:, 0, :]).astype(jnp.float32)
+
+
+# ── AdamW keeps a functional params tree (no CandidateContext) ────────────────
 def build_params(key):
     keys = jax.random.split(key, 20)
     init = 0.02
@@ -106,92 +179,6 @@ def build_params(key):
     return params
 
 
-def build_manifest():
-    entries = [
-        ManifestEntry(("patch_embed", "weight"), ParameterLayout.MATRIX, "patch_embed"),
-        ManifestEntry(("cls_token",), ParameterLayout.VECTOR, "cls_token"),
-        ManifestEntry(("pos_embed",), ParameterLayout.TABLE, "pos_embed"),
-        ManifestEntry(("ln_f", "scale"), ParameterLayout.VECTOR, "ln_f_scale"),
-        ManifestEntry(("ln_f", "bias"), ParameterLayout.VECTOR, "ln_f_bias"),
-        ManifestEntry(("head", "weight"), ParameterLayout.MATRIX, "head_w"),
-        ManifestEntry(("head", "bias"), ParameterLayout.VECTOR, "head_b"),
-    ]
-    for i in range(NUM_LAYERS):
-        p = f"layer{i}"
-        entries.extend([
-            ManifestEntry((p, "q", "weight"), ParameterLayout.MATRIX, f"{p}_q"),
-            ManifestEntry((p, "k", "weight"), ParameterLayout.MATRIX, f"{p}_k"),
-            ManifestEntry((p, "v", "weight"), ParameterLayout.MATRIX, f"{p}_v"),
-            ManifestEntry((p, "o", "weight"), ParameterLayout.MATRIX, f"{p}_o"),
-            ManifestEntry((p, "mlp1", "weight"), ParameterLayout.MATRIX, f"{p}_mlp1"),
-            ManifestEntry((p, "mlp2", "weight"), ParameterLayout.MATRIX, f"{p}_mlp2"),
-            ManifestEntry((p, "ln1", "scale"), ParameterLayout.VECTOR, f"{p}_ln1_s"),
-            ManifestEntry((p, "ln1", "bias"), ParameterLayout.VECTOR, f"{p}_ln1_b"),
-            ManifestEntry((p, "ln2", "scale"), ParameterLayout.VECTOR, f"{p}_ln2_s"),
-            ManifestEntry((p, "ln2", "bias"), ParameterLayout.VECTOR, f"{p}_ln2_b"),
-        ])
-    return Manifest(version=1, entries=tuple(entries))
-
-
-# ── ViT forward: ZeroGrad (candidate-based) ───────────────────────────────────
-def vit_forward_zg(params, candidate, images, quantize, bf16):
-    """Forward pass using CandidateContext for perturbed params."""
-    p = params
-    if bf16:
-        p = jax.tree_util.tree_map(
-            lambda v: v.astype(jnp.bfloat16) if isinstance(v, jax.Array) else v, params)
-
-    B = images.shape[0]
-    q = quantize_4bit if quantize else (lambda x: x)
-
-    patches = extract_patches(images)
-    if bf16:
-        patches = patches.astype(jnp.bfloat16)
-    x = candidate.linear(p, ("patch_embed", "weight"), patches)
-    x = q(x)
-
-    cls = candidate.vector(p, ("cls_token",))
-    x = jnp.concatenate([jnp.broadcast_to(cls, (B, 1, EMBED_DIM)), x], axis=1)
-    x = x + q(candidate.table_lookup(p, ("pos_embed",), jnp.arange(NUM_TOKENS)))
-
-    for i in range(NUM_LAYERS):
-        layer = f"layer{i}"
-        residual = x
-        h = layer_norm(x, candidate.vector(p, (layer, "ln1", "scale")),
-                       candidate.vector(p, (layer, "ln1", "bias")))
-
-        q_proj = q(candidate.linear(p, (layer, "q", "weight"), h))
-        k_proj = q(candidate.linear(p, (layer, "k", "weight"), h))
-        v_proj = q(candidate.linear(p, (layer, "v", "weight"), h))
-
-        qh = q_proj.reshape(B, NUM_TOKENS, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
-        kh = k_proj.reshape(B, NUM_TOKENS, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
-        vh = v_proj.reshape(B, NUM_TOKENS, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
-
-        attn = jax.nn.softmax(
-            jnp.einsum("bhnd,bhmd->bhnm", qh, kh) / jnp.sqrt(float(HEAD_DIM)), axis=-1)
-        attn_out = q(candidate.linear(
-            p, (layer, "o", "weight"),
-            jnp.einsum("bhnm,bhmd->bhnd", attn, vh)
-            .transpose(0, 2, 1, 3).reshape(B, NUM_TOKENS, EMBED_DIM)))
-
-        x = residual + attn_out
-        residual = x
-        h = layer_norm(x, candidate.vector(p, (layer, "ln2", "scale")),
-                       candidate.vector(p, (layer, "ln2", "bias")))
-        h = q(candidate.linear(p, (layer, "mlp1", "weight"), h))
-        h = jax.nn.gelu(h)
-        h = q(candidate.linear(p, (layer, "mlp2", "weight"), h))
-        x = residual + h
-
-    x = layer_norm(x, candidate.vector(p, ("ln_f", "scale")),
-                   candidate.vector(p, ("ln_f", "bias")))
-    logits = candidate.linear(p, ("head", "weight"), x[:, 0, :])
-    logits = logits + candidate.vector(p, ("head", "bias"))
-    return logits.astype(jnp.float32)
-
-
-# ── ViT forward: direct (for AdamW backprop) ─────────────────────────────────
 def vit_forward_direct(params, images, quantize, bf16):
     """Forward pass using params directly (for backprop). Uses STE if quantize."""
     p = params
@@ -200,7 +187,6 @@ def vit_forward_direct(params, images, quantize, bf16):
             lambda v: v.astype(jnp.bfloat16) if isinstance(v, jax.Array) else v, params)
 
     B = images.shape[0]
-    # STE for backprop, plain round for ZeroGrad
     q = quantize_4bit_ste if quantize else (lambda x: x)
 
     patches = extract_patches(images)
@@ -244,18 +230,25 @@ def vit_forward_direct(params, images, quantize, bf16):
     return logits.astype(jnp.float32)
 
 
-# ── Evaluation (unperturbed, float32, no quantization) ────────────────────────
-def evaluate(params, x_test, y_test):
-    """Evaluate on test set in float32 without quantization."""
+def evaluate_model(model, x_test, y_test):
+    was_q, was_bf16 = model.quantize, model.bf16
+    model.quantize = False
+    model.bf16 = False
+    logits = model(x_test)
+    model.quantize = was_q
+    model.bf16 = was_bf16
+    return jnp.mean(jnp.argmax(logits, axis=-1) == y_test)
+
+
+def evaluate_params(params, x_test, y_test):
     logits = vit_forward_direct(params, x_test, quantize=False, bf16=False)
     return jnp.mean(jnp.argmax(logits, axis=-1) == y_test)
 
 
-# ── ZeroGrad training ─────────────────────────────────────────────────────────
-def train_zerograd(name, params, manifest, x_train, y_train, x_test, y_test,
+def train_zerograd(name, x_train, y_train, x_test, y_test,
                    steps, batch_size, seed, quantize, bf16):
+    model = TinyVit(nnx.Rngs(seed), quantize=quantize, bf16=bf16)
     optimizer = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=5e-3, weight_decay=0.0),
         population_size=64,
         rank=8,
@@ -263,13 +256,13 @@ def train_zerograd(name, params, manifest, x_train, y_train, x_test, y_test,
         seed=seed,
         run_id=f"vit-{name}",
     )
-    state = optimizer.init(params)
+    state = optimizer.init(model)
     key = jax.random.key(seed + 100)
     num_train = x_train.shape[0]
 
-    def loss_fn(params, candidate, batch, rng):
+    def loss_fn(model, batch):
         x, y = batch
-        logits = vit_forward_zg(params, candidate, x, quantize=quantize, bf16=bf16)
+        logits = model(x)
         return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y)), None
 
     history = []
@@ -277,18 +270,17 @@ def train_zerograd(name, params, manifest, x_train, y_train, x_test, y_test,
         idx = jax.random.randint(jax.random.fold_in(key, step), (batch_size,), 0, num_train)
         batch = (x_train[idx], y_train[idx])
         t0 = time.time()
-        params, state, metrics = optimizer.step(state, params, batch, loss_fn)
+        model, state, metrics = optimizer.step(state, model, batch, loss_fn)
         dt = time.time() - t0
         if step % 25 == 0 or step == steps - 1:
-            acc = evaluate(params, x_test, y_test)
+            acc = evaluate_model(model, x_test, y_test)
             history.append((metrics.generation, float(metrics.mean_loss),
                             float(metrics.min_loss), float(acc), dt))
             print(f"  [{name}] gen {metrics.generation:3d}  "
                   f"loss={metrics.mean_loss:.4f}  acc={float(acc):.1%}  ({dt:.1f}s)")
-    return params, history
+    return model, history
 
 
-# ── AdamW backprop training ───────────────────────────────────────────────────
 def train_adamw(name, params, x_train, y_train, x_test, y_test,
                 steps, batch_size, seed, quantize, bf16):
     optimizer = optax.adamw(learning_rate=1e-3, weight_decay=0.0)
@@ -313,13 +305,12 @@ def train_adamw(name, params, x_train, y_train, x_test, y_test,
         params = optax.apply_updates(params, updates)
         dt = time.time() - t0
         if step % 25 == 0 or step == steps - 1:
-            acc = evaluate(params, x_test, y_test)
+            acc = evaluate_params(params, x_test, y_test)
             history.append((step, float(loss), float(loss), float(acc), dt))
             print(f"  [{name}] step {step:3d}  loss={float(loss):.4f}  acc={float(acc):.1%}  ({dt:.1f}s)")
     return params, history
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
         description="Train ViT on CIFAR-10: ZeroGrad vs AdamW, bf16 vs 4-bit QAT")
@@ -339,14 +330,13 @@ def main():
     y_test = jnp.array(y_test)
     print(f"  train: {x_train.shape}, test: {x_test.shape}")
 
-    sample_params = build_params(jax.random.key(args.seed))
-    total_params = sum(v.size for v in jax.tree_util.tree_leaves(sample_params))
+    sample = TinyVit(nnx.Rngs(args.seed))
+    total_params = sum(v.size for v in jax.tree_util.tree_leaves(params_pure_dict(sample)))
     print(f"\nViT: {NUM_LAYERS}L, {NUM_HEADS}H, dim={EMBED_DIM}, mlp={MLP_DIM}, "
           f"{NUM_PATCHES} patches ({PATCH_SIZE}×{PATCH_SIZE})")
     print(f"Parameters: {total_params:,}")
     print(f"Steps: {args.steps}, batch: {args.batch}\n")
 
-    manifest = build_manifest()
     results = {}
 
     variants = [
@@ -362,19 +352,21 @@ def main():
         print(f"{name.upper()}{ste_note}")
         print("=" * 70)
 
-        params = build_params(jax.random.key(args.seed))
         t_start = time.time()
 
         if method == "zerograd":
-            params, history = train_zerograd(
-                name, params, manifest, x_train, y_train, x_test, y_test,
+            artifact, history = train_zerograd(
+                name, x_train, y_train, x_test, y_test,
                 steps=args.steps, batch_size=args.batch, seed=args.seed,
                 quantize=quantize, bf16=bf16)
+            ckpt_params = params_pure_dict(artifact)
         else:
-            params, history = train_adamw(
+            params = build_params(jax.random.key(args.seed))
+            artifact, history = train_adamw(
                 name, params, x_train, y_train, x_test, y_test,
                 steps=args.steps, batch_size=args.batch, seed=args.seed,
                 quantize=quantize, bf16=bf16)
+            ckpt_params = artifact
 
         total_time = time.time() - t_start
         results[name] = {
@@ -385,18 +377,14 @@ def main():
             "history": history,
         }
         if args.checkpoint:
-            # Save each variant's final params + history so a long run is not
-            # lost on interruption (see issue #34).
-            import os
             save_checkpoint(
                 os.path.join(args.checkpoint, f"{name}.ckpt"),
-                step=args.steps, params=params, state=None,
+                step=args.steps, params=ckpt_params, state=None,
                 extra={"history": history, "method": method},
             )
             print(f"  checkpoint saved: {args.checkpoint}/{name}.ckpt")
         print()
 
-    # ── Comparison table ──────────────────────────────────────────────────────
     print("=" * 70)
     print("FINDINGS")
     print("=" * 70)
@@ -406,7 +394,6 @@ def main():
         print(f"{name:<25} {r['final_acc']:>7.1%} {r['final_loss']:>8.4f} "
               f"{r['total_time']:>7.1f}s {r['avg_step']:>7.2f}s")
 
-    # ── Key comparisons ───────────────────────────────────────────────────────
     print("\nKey comparisons:")
     zg_bf16 = results["zerograd-bf16"]["final_acc"]
     zg_4bit = results["zerograd-4bit"]["final_acc"]

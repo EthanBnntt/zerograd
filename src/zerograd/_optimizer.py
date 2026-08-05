@@ -6,14 +6,13 @@ import math
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from ._candidate import CandidateContext
 from ._eggroll_h import (
     antithetical_pair_id,
     antithetical_sign,
@@ -23,10 +22,11 @@ from ._eggroll_h import (
     update_alpha_schedule,
 )
 from ._fitness import shape_centered_loss, validate_losses
-from ._integer import float_view_tree, snap_tree_to_integer
+from ._integer import float_view_tree, qrange, snap_tree_to_integer
 from ._keys import candidate_key, step_key
 from ._manifest import Manifest, ParameterTree
 from ._nnx import (
+    ZeroGradSlot,
     apply_surgery,
     bind_candidate,
     disable_candidates,
@@ -37,8 +37,6 @@ from ._replay import replay, replay_integer
 
 Array = jax.Array
 
-# Legacy dict API: (params, CandidateContext, batch, rng) -> (loss, aux)
-LossFn = Callable[[ParameterTree, CandidateContext, Any, Array], tuple[Array, Any]]
 # NNX API: (model, batch) -> (loss, aux)  or  (model, batch, rng) -> (loss, aux)
 ModelLossFn = Callable[..., tuple[Array, Any]]
 
@@ -83,11 +81,9 @@ class ZeroGrad:
         state = opt.init(model)  # graph surgery + auto-manifest
         model, state, metrics = opt.step(state, model, batch, loss_fn)
 
-    **Legacy dict + Manifest** (still supported)::
-
-        opt = ZeroGrad(manifest, optax.adamw(1e-2), population_size=32, ...)
-        state = opt.init(params)
-        params, state, metrics = opt.step(state, params, batch, loss_fn)
+    Dict params with an explicit ``manifest=`` remain supported for
+    ``init`` / ``step_from_losses`` (custom evaluation). Prefer NNX for
+    ``step`` / ``evaluate_shard``.
     """
 
     def __init__(
@@ -109,34 +105,9 @@ class ZeroGrad:
         int_bin_updates: bool = False,
         check_finite: bool = True,
     ) -> None:
-        # Resolve NNX-style and legacy positional / keyword forms.
-        if args and isinstance(args[0], Manifest):
-            # Legacy: ZeroGrad(manifest, transform, population_size, rank, sigma, seed, run_id)
-            # Also: ZeroGrad(manifest, transform, population_size=..., rank=..., ...)
-            manifest = args[0]
-            if len(args) == 7:
-                _, transform, population_size, rank, sigma, seed, run_id = args
-            elif len(args) >= 2:
-                transform = args[1]
-                pos = list(args[2:])
-
-                def _pick(idx: int, kw: Any, default: Any) -> Any:
-                    if idx < len(pos):
-                        return pos[idx]
-                    return _coalesce(kw, default)
-
-                population_size = _pick(0, population_size, 32)
-                rank = _pick(1, rank, 4)
-                sigma = _pick(2, sigma, 0.01)
-                seed = _pick(3, seed, 0)
-                run_id = _pick(4, run_id, "zerograd")
-            else:
-                raise TypeError(
-                    "legacy ZeroGrad(manifest, transform, ...) requires a transform "
-                    "as the second argument"
-                )
-        elif args and isinstance(args[0], optax.GradientTransformation):
-            # NNX: ZeroGrad(transform, population_size=..., rank=..., ...)
+        # Resolve positional / keyword forms.
+        if len(args) > 0 and isinstance(args[0], optax.GradientTransformation):
+            # ZeroGrad(transform, population_size=..., rank=..., ...)
             if len(args) > 6:
                 raise TypeError("too many positional arguments for ZeroGrad")
             transform = args[0]
@@ -152,9 +123,9 @@ class ZeroGrad:
             sigma = _pick(2, sigma, 0.01)
             seed = _pick(3, seed, 0)
             run_id = _pick(4, run_id, "zerograd")
-        elif args:
+        elif len(args) > 0:
             raise TypeError(
-                "first argument must be an Optax GradientTransformation or a Manifest, "
+                "first argument must be an Optax GradientTransformation, "
                 f"got {type(args[0]).__name__}"
             )
         else:
@@ -219,7 +190,6 @@ class ZeroGrad:
         self._sigma = sigma
         self._seed = seed
         self._run_id = run_id
-        self._nnx_mode = False
         self._integer_es = bool(integer_es)
         self._sigma_shift = int(sigma_shift)
         self._update_alpha = float(update_alpha)
@@ -238,20 +208,6 @@ class ZeroGrad:
             self._ternary_bins or (bool(int_bin_updates) and not self._bin_updates)
         )
 
-    @classmethod
-    def from_manifest(
-        cls,
-        manifest: Manifest,
-        transform: optax.GradientTransformation,
-        population_size: int,
-        rank: int,
-        sigma: float,
-        seed: int,
-        run_id: str,
-    ) -> ZeroGrad:
-        """Construct a dict-param ZeroGrad with an explicit Manifest (legacy API)."""
-        return cls(manifest, transform, population_size, rank, sigma, seed, run_id)
-
     def init(self, model_or_params: nnx.Module | ParameterTree) -> ZeroGradState:
         """Initialize optimizer state.
 
@@ -260,10 +216,10 @@ class ZeroGrad:
         validates the explicit manifest.
         """
         if isinstance(model_or_params, nnx.Module):
-            from ._nnx import ZeroGradSlot
-
             model = model_or_params
-            already = hasattr(model, "zg_slot") and isinstance(model.zg_slot, ZeroGradSlot)
+            already = hasattr(model, "zg_slot") and isinstance(
+                getattr(model, "zg_slot", None), ZeroGradSlot
+            )
             if not already:
                 model, auto_manifest = apply_surgery(
                     model,
@@ -276,20 +232,23 @@ class ZeroGrad:
                 # group strings stay consistent with Manifest.entries.
                 self._manifest = auto_manifest
             else:
+                slot = getattr(model, "zg_slot")
+                assert isinstance(slot, ZeroGradSlot)
                 if self._manifest is None:
-                    if model.zg_slot.manifest is None:
+                    if slot.manifest is None:
                         raise ValueError(
                             "model is already surged but has no manifest; "
                             "re-init from an unsurgered module"
                         )
-                    self._manifest = model.zg_slot.manifest
+                    self._manifest = slot.manifest
                 else:
-                    model.zg_slot.manifest = self._manifest
-            model.zg_slot.rank = self._rank
-            model.zg_slot.sigma = self._sigma
-            model.zg_slot.sigma_shift = self._sigma_shift
-            model.zg_slot.integer_es = self._integer_es
-            self._nnx_mode = True
+                    slot.manifest = self._manifest
+            slot = getattr(model, "zg_slot")
+            assert isinstance(slot, ZeroGradSlot)
+            slot.rank = self._rank
+            slot.sigma = self._sigma
+            slot.sigma_shift = self._sigma_shift
+            slot.integer_es = self._integer_es
             assert self._manifest is not None
             params = params_pure_dict(model)
             self._manifest.validate(params)
@@ -303,9 +262,8 @@ class ZeroGrad:
         if self._manifest is None:
             raise ValueError(
                 "dict-parameter mode requires an explicit Manifest "
-                "(use ZeroGrad.from_manifest(...) or manifest=...)"
+                "(pass manifest=... to ZeroGrad)"
             )
-        self._nnx_mode = False
         self._manifest.validate(model_or_params)
         params = _materialize_tree(model_or_params)
         if self._bin_updates:
@@ -350,49 +308,22 @@ class ZeroGrad:
 
     def evaluate_shard(
         self,
-        model_or_params: nnx.Module | ParameterTree,
+        model: nnx.Module,
         generation: int,
-        loss_fn: LossFn | ModelLossFn,
+        loss_fn: ModelLossFn,
         batch: Any,
         candidate_ids: Array,
         *,
         rng: Array | None = None,
     ) -> Array:
         """Evaluate a subset of candidates and return their losses."""
-        if isinstance(model_or_params, nnx.Module):
-            return self._evaluate_shard_nnx(
-                model_or_params, generation, loss_fn, batch, candidate_ids, rng=rng
+        if not isinstance(model, nnx.Module):
+            raise TypeError(
+                "evaluate_shard requires an nnx.Module; dict-param LossFn "
+                "evaluation was removed with CandidateContext"
             )
-        assert self._manifest is not None
-        self._manifest.validate(model_or_params)
-        params = _materialize_tree(model_or_params)
-        return self._evaluate_shard_dict(params, generation, loss_fn, batch, candidate_ids, rng=rng)
-
-    def _evaluate_shard_dict(
-        self,
-        params: ParameterTree,
-        generation: int,
-        loss_fn: LossFn,
-        batch: Any,
-        candidate_ids: Array,
-        *,
-        rng: Array | None = None,
-    ) -> Array:
-        """Evaluate candidates (``vmap`` or chunked ``lax.map``) on the full batch."""
-        if rng is None:
-            rng = jax.random.key(0)
-        assert self._manifest is not None
-        base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
-
-        def evaluate_candidate(candidate_id: Array) -> Array:
-            ck = candidate_key(base_key, candidate_id)
-            candidate_rng = jax.random.fold_in(rng, candidate_id)
-            ctx = CandidateContext(self._manifest, ck, self._rank, self._sigma)
-            loss, _aux = loss_fn(params, ctx, batch, candidate_rng)
-            return loss
-
-        return _map_candidates(
-            evaluate_candidate, candidate_ids, chunk_size=self._candidate_chunk_size
+        return self._evaluate_shard_nnx(
+            model, generation, loss_fn, batch, candidate_ids, rng=rng
         )
 
     @property
@@ -510,8 +441,6 @@ class ZeroGrad:
         sig = _tree_sig(params)
         jit_fn = self._bin_update_jit_cache.get(sig)
         if jit_fn is None:
-            from ._integer import qrange
-
             qmin, qmax = qrange(self._int_bits)
 
             def _update(params_p, evidence_p):
@@ -546,8 +475,6 @@ class ZeroGrad:
             rank = self._rank
             half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
-            from ._integer import qrange
-
             qmin, qmax = qrange(self._int_bits)
 
             def replay_and_update(params_p, losses_p, base_key_p, thresholds_p):
@@ -606,6 +533,36 @@ class ZeroGrad:
                 f"losses must have {self._population_size} entries, got {losses.shape[0]}"
             )
 
+    def _optax_from_descent(
+        self,
+        params: ParameterTree,
+        descent: ParameterTree,
+        opt_state: Any,
+        *,
+        bits: int | None,
+        mask_integers_against: ParameterTree | None = None,
+    ) -> tuple[ParameterTree, Any]:
+        """Shared Optax update: pseudo-grad → transform → snap-to-integer."""
+        pseudo_grad = _build_pseudo_grad(descent, params)
+        if mask_integers_against is not None:
+            pseudo_grad = _mask_integer_leaves(pseudo_grad, mask_integers_against)
+            base = mask_integers_against
+        else:
+            base = params
+        float_params = float_view_tree(base)
+        updates, new_opt_state = self._transform.update(
+            pseudo_grad, opt_state, float_params
+        )
+        new_float = cast(ParameterTree, optax.apply_updates(float_params, updates))
+        if mask_integers_against is not None:
+            return cast(ParameterTree, _merge_keep_integers(base, new_float)), new_opt_state
+        if bits is None:
+            return cast(ParameterTree, snap_tree_to_integer(new_float, params)), new_opt_state
+        return (
+            cast(ParameterTree, snap_tree_to_integer(new_float, params, bits=bits)),
+            new_opt_state,
+        )
+
     def _step_from_losses(
         self,
         state: ZeroGradState,
@@ -651,14 +608,13 @@ class ZeroGrad:
                 descent = replay_integer(
                     params, self._manifest, base_key, pair_ids, pair_weights, self._rank
                 )
-                pseudo_grad = _build_pseudo_grad(descent, params)
-                pseudo_grad = _mask_integer_leaves(pseudo_grad, new_params)
-                float_params = float_view_tree(new_params)
-                updates, new_opt_state = self._transform.update(
-                    pseudo_grad, state.opt_state, float_params
+                new_params, new_opt_state = self._optax_from_descent(
+                    params,
+                    descent,
+                    state.opt_state,
+                    bits=None,
+                    mask_integers_against=new_params,
                 )
-                new_float = optax.apply_updates(float_params, updates)
-                new_params = _merge_keep_integers(new_params, new_float)
         elif self._integer_es:
             half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
@@ -667,25 +623,16 @@ class ZeroGrad:
             descent = replay_integer(
                 params, self._manifest, base_key, pair_ids, pair_weights, self._rank
             )
-            pseudo_grad = _build_pseudo_grad(descent, params)
-            float_params = float_view_tree(params)
-            updates, new_opt_state = self._transform.update(
-                pseudo_grad, state.opt_state, float_params
+            new_params, new_opt_state = self._optax_from_descent(
+                params, descent, state.opt_state, bits=self._int_bits
             )
-            new_float = optax.apply_updates(float_params, updates)
-            new_params = snap_tree_to_integer(new_float, params, bits=self._int_bits)
         else:
             candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
             shaped = shape_centered_loss(losses, self._sigma)
             descent = replay(params, self._manifest, base_key, candidate_ids, shaped, self._rank)
-            pseudo_grad = _build_pseudo_grad(descent, params)
-
-            float_params = float_view_tree(params)
-            updates, new_opt_state = self._transform.update(
-                pseudo_grad, state.opt_state, float_params
+            new_params, new_opt_state = self._optax_from_descent(
+                params, descent, state.opt_state, bits=None
             )
-            new_float = optax.apply_updates(float_params, updates)
-            new_params = snap_tree_to_integer(new_float, params)
 
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
         if self._population_size % 2 == 0:
@@ -707,40 +654,29 @@ class ZeroGrad:
     def step(
         self,
         state: ZeroGradState,
-        model_or_params: nnx.Module | ParameterTree,
+        model: nnx.Module,
         batch: Any,
-        loss_fn: LossFn | ModelLossFn,
+        loss_fn: ModelLossFn,
         *,
         rng: Array | None = None,
     ) -> tuple[Any, ZeroGradState, StepMetrics]:
         """Execute one transactional optimization generation."""
         if not isinstance(state, ZeroGradState):
             raise TypeError("state must be a ZeroGradState")
+        if not isinstance(model, nnx.Module):
+            raise TypeError(
+                "step requires an nnx.Module; dict-param LossFn evaluation was "
+                "removed with CandidateContext (use step_from_losses for custom eval)"
+            )
         if rng is None:
             rng = jax.random.key(0)
 
         generation = state.generation
         candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
-
-        if isinstance(model_or_params, nnx.Module):
-            model = model_or_params
-            # Candidates are independent: one flat vmap gives XLA a single
-            # dense population axis. A nested [pair, sign] vmap shared PRNG
-            # factors but measured slower on H100 due to less favorable kernel
-            # shapes, so antithetical IDs stay in this flat batch.
-            losses = self._evaluate_shard_nnx(
-                model, generation, loss_fn, batch, candidate_ids, rng=rng
-            )
-            return self.step_from_losses(state, model, losses)
-
-        assert self._manifest is not None
-        self._manifest.validate(model_or_params)
-        params = _materialize_tree(model_or_params)
-        losses = self._evaluate_shard_dict(
-            params, generation, loss_fn, batch, candidate_ids, rng=rng
+        losses = self._evaluate_shard_nnx(
+            model, generation, loss_fn, batch, candidate_ids, rng=rng
         )
-        self._check_losses(losses)
-        return self._step_from_losses(state, params, losses)
+        return self.step_from_losses(state, model, losses)
 
 
 def _map_candidates(
@@ -766,7 +702,7 @@ def _is_identity_transform(transform: optax.GradientTransformation) -> bool:
     state = transform.init(probe)
     updates, _ = transform.update(probe, state, probe)
     # identity: updates == grads; adam/sgd: updates differ in scale/sign handling
-    return bool(jnp.allclose(updates, probe))
+    return bool(jnp.allclose(cast(Any, updates), probe))
 
 
 def _call_model_loss(
@@ -831,20 +767,20 @@ def _materialize_tree(params: ParameterTree) -> dict:
     return out
 
 
-def _build_pseudo_grad(descent: dict, params: ParameterTree) -> dict:
+def _build_pseudo_grad(descent: ParameterTree, params: ParameterTree) -> ParameterTree:
     """Negate the descent direction and fill zeros for non-manifest parameters."""
     result: dict = {}
     _apply_negation(params, (), descent, result)
     return result
 
 
-def _mask_integer_leaves(grads: dict, params: ParameterTree) -> dict:
+def _mask_integer_leaves(grads: ParameterTree, params: ParameterTree) -> ParameterTree:
     """Zero Optax grads on integer leaves (already handled by bin updates)."""
     out: dict = {}
     for key, value in params.items():
         g = grads.get(key) if isinstance(grads, dict) else None
         if isinstance(value, Mapping):
-            out[key] = _mask_integer_leaves(g if isinstance(g, dict) else {}, value)
+            out[key] = _mask_integer_leaves(g if isinstance(g, Mapping) else {}, value)
         elif isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jnp.integer):
             out[key] = jnp.zeros_like(value, dtype=jnp.float32)
         elif isinstance(g, jax.Array):
@@ -872,7 +808,12 @@ def _merge_keep_integers(int_params: ParameterTree, float_updated: ParameterTree
     return out
 
 
-def _apply_negation(params: ParameterTree, path: tuple[str, ...], descent: dict, out: dict) -> None:
+def _apply_negation(
+    params: ParameterTree,
+    path: tuple[str, ...],
+    descent: ParameterTree,
+    out: dict,
+) -> None:
     """Walk the parameter tree, negating manifest entries and zeroing others."""
     for key, value in params.items():
         current_path = path + (key,)
@@ -881,7 +822,7 @@ def _apply_negation(params: ParameterTree, path: tuple[str, ...], descent: dict,
             _apply_negation(value, current_path, descent, sub_out)
             out[key] = sub_out
         elif isinstance(value, jax.Array):
-            node = descent
+            node: Any = descent
             found = True
             for part in current_path:
                 if not isinstance(node, dict) or part not in node:

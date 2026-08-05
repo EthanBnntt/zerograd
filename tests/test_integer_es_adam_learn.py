@@ -20,21 +20,18 @@ import optax
 from flax import nnx
 
 from zerograd import IntLinear, ZeroGrad, ZgIntLinear
-from zerograd._integer import float_to_int, float_view_tree, snap_tree_to_integer
+from zerograd._integer import float_to_int, float_view_tree, int_relu, snap_tree_to_integer
 from zerograd._nnx import params_pure_dict
 
 
 class IntMLP(nnx.Module):
     """Small pure-int MLP for synthetic tasks."""
 
-    def __init__(self, din: int, hidden: int, dout: int, *, rngs: nnx.Rngs, bits: int = 8):
-        self.bits = bits
-        self.l1 = IntLinear(din, hidden, bits=bits, out_shift=6, rngs=rngs)
-        self.l2 = IntLinear(hidden, dout, bits=bits, out_shift=6, act_dtype=jnp.int32, rngs=rngs)
+    def __init__(self, din: int, hidden: int, dout: int, *, rngs: nnx.Rngs):
+        self.l1 = IntLinear(din, hidden, rngs=rngs)
+        self.l2 = IntLinear(hidden, dout, act_dtype=jnp.int32, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        from zerograd._integer import int_relu
-
         h = int_relu(self.l1(x))
         return self.l2(h)
 

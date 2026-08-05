@@ -33,8 +33,7 @@ from _xor_model import (
     XOR_X,
     XOR_Y,
     accuracy,
-    build_manifest,
-    build_params,
+    build_model,
     loss_fn,
 )
 
@@ -42,17 +41,16 @@ from _xor_model import (
 def run_baseline(steps, seed, pop, lr):
     """Single-node baseline for comparison."""
     opt = ZeroGrad(
-        build_manifest(),
         optax.adamw(learning_rate=lr, weight_decay=0.0),
         population_size=pop, rank=4, sigma=0.15,
         seed=seed, run_id="unreliable-sim",
     )
-    params = build_params(jax.random.key(seed))
-    state = opt.init(params)
+    model = build_model(jax.random.key(seed))
+    state = opt.init(model)
     batch = (XOR_X, XOR_Y)
     for _ in range(steps):
-        params, state, _ = opt.step(state, params, batch, loss_fn)
-    return params
+        model, state, _ = opt.step(state, model, batch, loss_fn)
+    return model
 
 
 def main():
@@ -66,7 +64,6 @@ def main():
     batch = (XOR_X, XOR_Y)
 
     opt = ZeroGrad(
-        build_manifest(),
         optax.adamw(learning_rate=args.lr, weight_decay=0.0),
         population_size=args.pop, rank=4, sigma=0.15,
         seed=args.seed, run_id="unreliable-sim",
@@ -74,7 +71,7 @@ def main():
 
     # Start with 2 nodes
     fc = FaultTolerantCluster(
-        opt, build_params, loss_fn, seed=args.seed, initial_nodes=2,
+        opt, build_model, loss_fn, seed=args.seed, initial_nodes=2,
     )
 
     rng = random.Random(123)
@@ -132,13 +129,13 @@ def main():
                     event_log.append(f"gen {gen}: = node {idx} weight={w}")
 
         # Training step
-        params, state, metrics = fc.step(batch)
+        model, state, metrics = fc.step(batch)
 
         # Verify sync periodically
         synced = fc.verify_sync()
 
         if step % 20 == 0 or step == args.steps - 1:
-            acc = accuracy(params)
+            acc = accuracy(model)
             print(f"  gen {metrics.generation:3d}  loss={metrics.mean_loss:.4f}  "
                   f"acc={acc:.0%}  nodes={fc.num_active_nodes}/{fc.num_total_nodes}  "
                   f"part={fc.partition_sizes}  sync={'✓' if synced else '✗'}  "
@@ -157,7 +154,7 @@ def main():
     print(f"{'=' * 70}")
 
     final_synced = fc.verify_sync()
-    acc = accuracy(params)
+    acc = accuracy(model)
 
     # Compare against single-node baseline
     baseline = run_baseline(args.steps, args.seed, args.pop, args.lr)

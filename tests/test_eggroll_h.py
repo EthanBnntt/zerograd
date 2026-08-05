@@ -8,15 +8,18 @@ from flax import nnx
 
 from zerograd import (
     IntLinear,
+    IntLUT,
+    ParameterLayout,
     ZeroGrad,
     ZgIntLinear,
     apply_bin_updates,
     bin_update_threshold,
     shape_antithetical_loss,
+    threshold_tree_for_manifest,
 )
 import optax
 from zerograd._eggroll_h import int8_from_normal, update_alpha_schedule
-from zerograd._integer import float_to_int
+from zerograd._integer import float_to_int, int_relu
 from zerograd._nnx import params_pure_dict
 
 
@@ -26,8 +29,6 @@ class TinyInt(nnx.Module):
         self.l2 = IntLinear(8, 1, rngs=rngs)
 
     def __call__(self, x):
-        from zerograd._integer import int_relu
-
         return self.l2(int_relu(self.l1(x)))
 
 
@@ -52,8 +53,6 @@ class TestEggrollH:
 
     def test_vector_threshold_below_matrix(self):
         """VECTOR evidence is one factor; MATRIX/TABLE use A@B (two factors)."""
-        from zerograd import ParameterLayout
-
         n = 128
         alpha = 0.12
         v = bin_update_threshold(alpha, n, layout=ParameterLayout.VECTOR)
@@ -77,12 +76,9 @@ class TestEggrollH:
         assert int(out[0, 1]) == 0
 
     def test_threshold_tree_scales_lut_vs_kernel(self):
-        from zerograd import IntLinear, IntLUT, ParameterLayout, threshold_tree_for_manifest
-        from zerograd._nnx import params_pure_dict
-
         class M(nnx.Module):
             def __init__(self, rngs):
-                self.l = IntLinear(4, 4, egg=True, rngs=rngs)
+                self.l = IntLinear(4, 4, rngs=rngs)
                 self.act = IntLUT(init="identity", rngs=rngs)
 
             def __call__(self, x):

@@ -29,8 +29,9 @@ import time
 import jax
 import jax.numpy as jnp
 import optax
+from flax import nnx
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, ZeroGrad
+from zerograd import ZeroGrad
 
 from _data import load_mnist
 
@@ -40,47 +41,30 @@ HIDDEN_DIM = 128
 OUTPUT_DIM = 10
 
 
-def build_params(key):
-    k1, k2 = jax.random.split(key)
-    return {
-        "w1": jax.random.normal(k1, (INPUT_DIM, HIDDEN_DIM)) * 0.02,
-        "b1": jnp.zeros((HIDDEN_DIM,)),
-        "w2": jax.random.normal(k2, (HIDDEN_DIM, OUTPUT_DIM)) * 0.02,
-        "b2": jnp.zeros((OUTPUT_DIM,)),
-    }
+class MnistMLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.l1 = nnx.Linear(INPUT_DIM, HIDDEN_DIM, rngs=rngs)
+        self.l2 = nnx.Linear(HIDDEN_DIM, OUTPUT_DIM, rngs=rngs)
+
+    def __call__(self, x):
+        return self.l2(nnx.relu(self.l1(x)))
 
 
-def build_manifest():
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w1",), ParameterLayout.MATRIX, "w1"),
-        ManifestEntry(("b1",), ParameterLayout.VECTOR, "b1"),
-        ManifestEntry(("w2",), ParameterLayout.MATRIX, "w2"),
-        ManifestEntry(("b2",), ParameterLayout.VECTOR, "b2"),
-    ))
-
-
-def loss_fn(params, candidate, batch, rng):
+def loss_fn(model, batch):
     x, y = batch
-    h = jax.nn.relu(candidate.linear(params, ("w1",), x))
-    h = h + candidate.vector(params, ("b1",))
-    logits = candidate.linear(params, ("w2",), h)
-    logits = logits + candidate.vector(params, ("b2",))
+    logits = model(x)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, y)), None
 
 
-def evaluate(params, x_test, y_test):
-    h = jax.nn.relu(x_test @ params["w1"]) + params["b1"]
-    logits = h @ params["w2"] + params["b2"]
-    preds = jnp.argmax(logits, axis=-1)
+def evaluate(model, x_test, y_test):
+    preds = jnp.argmax(model(x_test), axis=-1)
     return float(jnp.mean(preds == y_test))
 
 
 def run_config(name, pop, batch_size, x_train, y_train, x_test, y_test, steps, sigma, lr, seed):
-    manifest = build_manifest()
-    params = build_params(jax.random.key(seed))
+    model = MnistMLP(nnx.Rngs(seed))
 
     optimizer = ZeroGrad(
-        manifest,
         optax.adamw(learning_rate=lr, weight_decay=0.0),
         population_size=pop,
         rank=8,
@@ -88,7 +72,7 @@ def run_config(name, pop, batch_size, x_train, y_train, x_test, y_test, steps, s
         seed=seed,
         run_id=f"bvp-{name}",
     )
-    state = optimizer.init(params)
+    state = optimizer.init(model)
 
     key = jax.random.key(seed + 100)
     num_train = x_train.shape[0]
@@ -99,17 +83,17 @@ def run_config(name, pop, batch_size, x_train, y_train, x_test, y_test, steps, s
         idx = jax.random.randint(jax.random.fold_in(key, step), (batch_size,), 0, num_train)
         batch = (x_train[idx], y_train[idx])
 
-        params, state, metrics = optimizer.step(state, params, batch, loss_fn)
+        model, state, metrics = optimizer.step(state, model, batch, loss_fn)
 
         if step % 25 == 0 or step == steps - 1:
-            acc = evaluate(params, x_test, y_test)
+            acc = evaluate(model, x_test, y_test)
             history.append((metrics.generation, float(metrics.mean_loss), acc))
             print(f"  [{name}] gen {metrics.generation:3d}  "
                   f"loss={metrics.mean_loss:.4f}  "
                   f"acc={acc:.1%}  "
                   f"({(time.time() - t0) / (step + 1):.2f}s/step)")
 
-    final_acc = evaluate(params, x_test, y_test)
+    final_acc = evaluate(model, x_test, y_test)
     total_time = time.time() - t0
     return final_acc, float(metrics.mean_loss), total_time, history
 
@@ -175,22 +159,12 @@ def main():
         print(f"{name:<20} {r['pop']:>5} {r['batch']:>6} "
               f"{r['final_acc']:>7.1%} {r['final_loss']:>8.4f} {r['total_time']:>7.1f}s")
 
-    # ── Analysis ──────────────────────────────────────────────────────────────
-    print("\nKey findings:")
-    best_acc = max(r["final_acc"] for r in results.values())
-    best_name = [n for n, r in results.items() if r["final_acc"] == best_acc][0]
-    print(f"  Best accuracy: {best_name} ({best_acc:.1%})")
-
-    # Find inflection point
-    configs_sorted = sorted(results.values(), key=lambda r: r["pop"])
-    print(f"\n  Population sweep (batch decreases as pop increases):")
-    for r in configs_sorted:
-        bar = "█" * int(r["final_acc"] * 50)
-        print(f"    pop={r['pop']:>3} batch={r['batch']:>4}: {r['final_acc']:>5.1%} {bar}")
-
-    print(f"\n  Total compute held constant at {total_compute} forward passes/step")
-    print(f"  Bigger batch → lower loss variance per candidate (cleaner fitness signal)")
-    print(f"  Bigger pop → more perturbation directions (richer gradient)")
+    # Find best
+    best = max(results.items(), key=lambda kv: kv[1]["final_acc"])
+    print(f"\nBest accuracy: {best[0]} ({best[1]['final_acc']:.1%})")
+    print("\nInterpretation: if larger pop wins → more directions help more than")
+    print("cleaner per-candidate losses. If larger batch wins → loss variance")
+    print("was the bottleneck.")
 
 
 if __name__ == "__main__":

@@ -2,19 +2,17 @@
 
 import jax
 import jax.numpy as jnp
-import optax
+import numpy as np
 import pytest
 from flax import nnx
 from zerograd._nnx import params_pure_dict
 
+from _tiny import make_model, make_opt, mse_loss as _loss_fn
 from zerograd import (
     CalibrationResult,
     DeviceShard,
     DistributedZeroGrad,
     IntLinear,
-    Manifest,
-    ManifestEntry,
-    ParameterLayout,
     ShardResult,
     ReplicatedDistributedZeroGrad,
     ZeroGrad,
@@ -22,29 +20,12 @@ from zerograd import (
 )
 
 
-# ── Shared helpers ───────────────────────────────────────────────────────────
-
-def _manifest():
-    return Manifest(version=1, entries=(
-        ManifestEntry(("w",), ParameterLayout.MATRIX, "w"),
-    ))
-
-
-def _params():
-    return {"w": jnp.ones((4, 2))}
-
-
-def _loss_fn(p, candidate, batch, rng):
-    return jnp.sum(candidate.linear(p, ("w",), batch) ** 2), None
+def _model():
+    return make_model(0)
 
 
 def _make_opt(pop=8, **kw):
-    defaults = dict(
-        manifest=_manifest(), transform=optax.adamw(0.01),
-        population_size=pop, rank=2, sigma=0.1, seed=42, run_id="dist-test",
-    )
-    defaults.update(kw)
-    return ZeroGrad(**defaults)
+    return make_opt(pop=pop, run_id="dist-test", **kw)
 
 
 def _a_device():
@@ -119,10 +100,11 @@ class TestDeviceShard:
     def test_evaluate_returns_shard_result(self):
         opt = _make_opt()
         shard = DeviceShard(_a_device(), opt, _loss_fn)
-        params = _params()
+        model = _model()
+        opt.init(model)
         batch = jnp.ones((3, 4))
         ids = jnp.arange(4, dtype=jnp.int32)
-        result = shard.evaluate(params, batch, ids, generation=0)
+        result = shard.evaluate(model, batch, ids, generation=0)
         assert isinstance(result, ShardResult)
         assert result.losses.shape == (4,)
         # candidate_ids echoed back unchanged
@@ -131,8 +113,10 @@ class TestDeviceShard:
     def test_evaluate_uses_default_rng_when_none(self):
         opt = _make_opt()
         shard = DeviceShard(_a_device(), opt, _loss_fn)
+        model = _model()
+        opt.init(model)
         # rng=None path should not raise and should produce finite losses.
-        result = shard.evaluate(_params(), jnp.ones((3, 4)), jnp.arange(4, dtype=jnp.int32), 0)
+        result = shard.evaluate(model, jnp.ones((3, 4)), jnp.arange(4, dtype=jnp.int32), 0)
         assert bool(jnp.all(jnp.isfinite(result.losses)))
 
 
@@ -183,54 +167,54 @@ class TestDistributedConstruction:
 class TestDistributedStep:
     def test_init_returns_generation_zero(self):
         coord = DistributedZeroGrad(_make_opt(), [_a_device()], _loss_fn)
-        state = coord.init(_params())
+        state = coord.init(_model())
         assert state.generation == 0
 
     def test_single_device_step_matches_plain_optimizer(self):
         opt = _make_opt(pop=8)
-        params = _params()
-        state = opt.init(params)
+        model = _model()
+        state = opt.init(model)
         batch = jnp.ones((3, 4))
-        ref_params, ref_state, _ = opt.step(state, params, batch, _loss_fn)
+        ref_model, ref_state, _ = opt.step(state, model, batch, _loss_fn)
 
         coord = DistributedZeroGrad(opt, [_a_device()], _loss_fn)
-        dstate = coord.init(params)
-        new_params, new_state, metrics = coord.step(dstate, params, batch)
+        dstate = coord.init(model)
+        new_model, new_state, metrics = coord.step(dstate, model, batch)
 
         assert new_state.generation == 1
         assert metrics.population_size == 8
-        for a, b in zip(jax.tree_util.tree_leaves(new_params), jax.tree_util.tree_leaves(ref_params)):
+        for a, b in zip(jax.tree_util.tree_leaves(params_pure_dict(new_model)), jax.tree_util.tree_leaves(params_pure_dict(ref_model))):
             np_allclose(a, b)
 
     def test_multi_device_step_matches_single_device(self):
         opt = _make_opt(pop=8)
-        params = _params()
+        model = _model()
         batch = jnp.ones((3, 4))
 
         coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn)
-        dstate = coord.init(params)
-        new_params, new_state, _ = coord.step(dstate, params, batch)
+        dstate = coord.init(model)
+        new_model, new_state, _ = coord.step(dstate, model, batch)
         assert new_state.generation == 1
-        assert bool(jnp.all(jnp.isfinite(new_params["w"])))
+        assert bool(jnp.all(jnp.isfinite(params_pure_dict(new_model)["l"]["kernel"])))
 
     def test_weighted_partition_step(self):
         opt = _make_opt(pop=8)
-        params = _params()
+        model = _model()
         batch = jnp.ones((3, 4))
         coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn, weights=[1.0, 3.0])
         assert coord.partition_sizes == [2, 6]
-        dstate = coord.init(params)
-        _, new_state, _ = coord.step(dstate, params, batch)
+        dstate = coord.init(model)
+        _, new_state, _ = coord.step(dstate, model, batch)
         assert new_state.generation == 1
 
     def test_zero_weight_shard_skipped(self):
         opt = _make_opt(pop=8)
-        params = _params()
+        model = _model()
         batch = jnp.ones((3, 4))
         coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn, weights=[0.0, 1.0])
         assert coord.partition_sizes == [0, 8]
-        dstate = coord.init(params)
-        _, new_state, _ = coord.step(dstate, params, batch)
+        dstate = coord.init(model)
+        _, new_state, _ = coord.step(dstate, model, batch)
         assert new_state.generation == 1
 
 
@@ -239,11 +223,11 @@ class TestShutdown:
 
     def test_shutdown_releases_executor_and_blocks_step(self):
         coord = DistributedZeroGrad(_make_opt(), [_a_device()], _loss_fn)
-        coord.init(_params())
+        coord.init(_model())
         coord.shutdown()
         assert coord._executor is None
         with pytest.raises(RuntimeError):
-            coord.step(coord.init(_params()), _params(), jnp.ones((3, 4)))
+            coord.step(coord.init(_model()), _model(), jnp.ones((3, 4)))
 
     def test_shutdown_is_idempotent(self):
         coord = DistributedZeroGrad(_make_opt(), [_a_device()], _loss_fn)
@@ -256,14 +240,16 @@ class TestShutdown:
             assert coord._executor is not None
         assert coord._executor is None
         with pytest.raises(RuntimeError):
-            coord.step(coord.init(_params()), _params(), jnp.ones((3, 4)))
+            coord.step(coord.init(_model()), _model(), jnp.ones((3, 4)))
 
 
 class TestCalibrate:
     def test_calibrate_updates_weights_and_returns_results(self):
         opt = _make_opt(pop=8)
         coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn)
-        results = coord.calibrate(_params(), jnp.ones((3, 4)), warmup=0, trials=1)
+        model = _model()
+        opt.init(model)
+        results = coord.calibrate(model, jnp.ones((3, 4)), warmup=0, trials=1)
         assert len(results) == 2
         assert all(isinstance(r, CalibrationResult) for r in results)
         # Weights were updated (no longer equal in general, but length matches).
@@ -274,7 +260,9 @@ class TestCalibrate:
     def test_calibrate_result_fields_populated(self):
         opt = _make_opt(pop=8)
         coord = DistributedZeroGrad(opt, [_a_device()], _loss_fn)
-        results = coord.calibrate(_params(), jnp.ones((3, 4)), warmup=1, trials=2)
+        model = _model()
+        opt.init(model)
+        results = coord.calibrate(model, jnp.ones((3, 4)), warmup=1, trials=2)
         r = results[0]
         assert r.num_candidates == 4
         assert r.elapsed_seconds > 0
@@ -283,13 +271,12 @@ class TestCalibrate:
 
 
 def np_allclose(a, b):
-    import numpy as np
     np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-5, atol=1e-5)
 
 
 class _TinyIntModel(nnx.Module):
     def __init__(self, seed: int = 0):
-        self.linear = IntLinear(4, 2, egg=True, rngs=nnx.Rngs(seed))
+        self.linear = IntLinear(4, 2, rngs=nnx.Rngs(seed))
 
     def __call__(self, x):
         return self.linear(x)
