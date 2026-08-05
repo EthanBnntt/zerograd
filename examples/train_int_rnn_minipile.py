@@ -4,7 +4,7 @@ Architecture (all int8 until the head). The main block is ``IntLinearLUT``:
 
   int8 @ int8 → int32 accum → int8 requant → learnable IntLUT
 
-  Qwen3.6 subword ids → int8 ``nnx.Embed`` (surgery → ``ZgEmbed``)
+  Qwen3.6 subword ids → int8 ``IntEmbedding`` (surgery → ``ZgIntEmbedding``)
   → ×L IntDeltaBlock:
         pre-norm → multi-head **Gated Delta Rule-2** scan → residual
         pre-norm → int8 MLP (IntLinearLUT²) → residual
@@ -57,13 +57,14 @@ from flax import nnx
 
 from zerograd import (
     IntAffine,
+    IntEmbedding,
     IntLinear,
     IntLinearLUT,
     IntLUT,
     ZeroGrad,
     egg_clip_cast,
 )
-from zerograd._integer import egg_init_matrix, egg_matmul_divisor, int_matmul
+from zerograd._integer import egg_matmul_divisor, int_matmul
 from zerograd._nnx import LayerIndex, disable_candidates, params_pure_dict, update_params
 
 # ── Architecture defaults (overridden by CLI via ``configure_architecture``) ─
@@ -142,7 +143,6 @@ def _linear_lut(in_features: int, out_features: int, *, rngs: nnx.Rngs) -> IntLi
         out_features,
         use_bias=False,
         bits=BITS,
-        egg=True,
         lut_init="identity",
         explore_shift=0,
         rngs=rngs,
@@ -377,7 +377,6 @@ class MultiHeadGatedDelta2Mixer(nnx.Module):
             6 * EMBED_DIM,
             use_bias=False,
             bits=BITS,
-            egg=True,
             act_dtype=jnp.int8,
             rngs=rngs,
         )
@@ -440,9 +439,9 @@ class IntDeltaBlock(nnx.Module):
     """One pre-norm DeltaNet-2 block: mixer residual + MLP residual."""
 
     def __init__(self, *, rngs: nnx.Rngs, delta_impl: str = "chunkwise"):
-        self.n1 = IntAffine(EMBED_DIM, bits=BITS, egg=True, rngs=rngs)
+        self.n1 = IntAffine(EMBED_DIM, bits=BITS, rngs=rngs)
         self.mixer = MultiHeadGatedDelta2Mixer(rngs=rngs, impl=delta_impl)
-        self.n2 = IntAffine(EMBED_DIM, bits=BITS, egg=True, rngs=rngs)
+        self.n2 = IntAffine(EMBED_DIM, bits=BITS, rngs=rngs)
         self.mlp = Int8Mlp(rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -470,12 +469,6 @@ def _scan_delta_layer(x: jax.Array, layer: IntDeltaBlock) -> jax.Array:
     return layer(x)
 
 
-def _egg_embed_init(rng: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype) -> jax.Array:
-    """EGG int8 embedding init for ``nnx.Embed``."""
-    del dtype
-    return egg_init_matrix(rng, shape)
-
-
 class IntRnnLM(nnx.Module):
     """``NUM_LAYERS``-deep pure-integer causal LM (Gated DeltaNet-2 + int8 MLP)."""
 
@@ -489,15 +482,8 @@ class IntRnnLM(nnx.Module):
     ):
         self.vocab_size = int(vocab_size)
         self.delta_impl = delta_impl
-        # nnx.Embed → surgery → ZgEmbed (learnable TABLE, row-sparse ES factors).
-        self.embed = nnx.Embed(
-            num_embeddings=self.vocab_size,
-            features=EMBED_DIM,
-            dtype=jnp.int8,
-            param_dtype=jnp.int8,
-            embedding_init=_egg_embed_init,
-            rngs=rngs,
-        )
+        # IntEmbedding → surgery → ZgIntEmbedding (TABLE, row-sparse ES factors).
+        self.embed = IntEmbedding(self.vocab_size, EMBED_DIM, rngs=rngs)
         layers = int(num_layers)
 
         @nnx.split_rngs(splits=layers)
@@ -509,7 +495,7 @@ class IntRnnLM(nnx.Module):
         # ``_scan_delta_layer``. This avoids Python-unrolling twelve copies of
         # the block into the candidate executable.
         self.layers = create_layer(rngs)
-        self.norm_f = IntAffine(EMBED_DIM, bits=BITS, egg=True, rngs=rngs)
+        self.norm_f = IntAffine(EMBED_DIM, bits=BITS, rngs=rngs)
 
     def _prepare_embed_factors(self) -> tuple[jax.Array, jax.Array] | None:
         prepare = getattr(self.embed, "candidate_factors", None)

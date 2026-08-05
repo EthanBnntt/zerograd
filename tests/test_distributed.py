@@ -289,7 +289,7 @@ def np_allclose(a, b):
 
 class _TinyIntModel(nnx.Module):
     def __init__(self, seed: int = 0):
-        self.linear = IntLinear(4, 2, egg=True, rngs=nnx.Rngs(seed))
+        self.linear = IntLinear(4, 2, rngs=nnx.Rngs(seed))
 
     def __call__(self, x):
         return self.linear(x)

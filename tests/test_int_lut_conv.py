@@ -28,9 +28,9 @@ from zerograd._nnx import params_pure_dict
 
 class TinyIntCnn(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
-        self.conv = IntConv(1, 4, kernel_size=3, padding="SAME", egg=True, rngs=rngs)
+        self.conv = IntConv(1, 4, kernel_size=3, padding="SAME", rngs=rngs)
         self.act = IntLUT(init="identity", explore_shift=0, rngs=rngs)
-        self.head = IntLinear(4, 3, bits=8, egg=True, act_dtype=jnp.int32, rngs=rngs)
+        self.head = IntLinear(4, 3, bits=8, act_dtype=jnp.int32, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: int8 NHWC
@@ -42,7 +42,7 @@ class TinyIntCnn(nnx.Module):
 
 class TestIntLinearLUT:
     def test_forward_is_linear_then_lut(self):
-        block = IntLinearLUT(4, 4, use_bias=False, egg=True, rngs=nnx.Rngs(0))
+        block = IntLinearLUT(4, 4, use_bias=False, rngs=nnx.Rngs(0))
         x = jnp.ones((2, 4), dtype=jnp.int8)
         y = block(x)
         assert y.dtype == jnp.int8
@@ -53,7 +53,7 @@ class TestIntLinearLUT:
     def test_surgery_wraps_children(self):
         class M(nnx.Module):
             def __init__(self, rngs):
-                self.block = IntLinearLUT(4, 4, egg=True, rngs=rngs)
+                self.block = IntLinearLUT(4, 4, rngs=rngs)
 
             def __call__(self, x):
                 return self.block(x)
@@ -89,7 +89,7 @@ class TestIntLUT:
         class M(nnx.Module):
             def __init__(self, rngs):
                 self.act = IntLUT(rngs=rngs)
-                self.l = IntLinear(4, 4, egg=True, rngs=rngs)
+                self.l = IntLinear(4, 4, rngs=rngs)
 
             def __call__(self, x):
                 return self.l(self.act(x))
@@ -179,7 +179,7 @@ class TestIntConv:
     def test_surgery_wraps_int_conv(self):
         class M(nnx.Module):
             def __init__(self, rngs):
-                self.conv = IntConv(3, 8, kernel_size=3, egg=True, rngs=rngs)
+                self.conv = IntConv(3, 8, kernel_size=3, rngs=rngs)
 
             def __call__(self, x):
                 return self.conv(x)
@@ -191,7 +191,7 @@ class TestIntConv:
         assert any(e.path == ("conv", "kernel") for e in manifest.entries)
 
     def test_forward_int8(self):
-        m = IntConv(1, 4, kernel_size=3, egg=True, rngs=nnx.Rngs(0))
+        m = IntConv(1, 4, kernel_size=3, rngs=nnx.Rngs(0))
         x = jnp.ones((2, 8, 8, 1), dtype=jnp.int8)
         y = m(x)
         assert y.dtype == jnp.int8

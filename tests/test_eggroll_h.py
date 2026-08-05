@@ -82,7 +82,7 @@ class TestEggrollH:
 
         class M(nnx.Module):
             def __init__(self, rngs):
-                self.l = IntLinear(4, 4, egg=True, rngs=rngs)
+                self.l = IntLinear(4, 4, rngs=rngs)
                 self.act = IntLUT(init="identity", rngs=rngs)
 
             def __call__(self, x):

@@ -35,12 +35,9 @@ from ._integer import (
     egg_init_matrix,
     egg_matmul_divisor,
     egg_requantize,
-    float_to_int,
     int_conv2d,
     int_conv2d_flat,
     int_matmul,
-    qrange,
-    requantize,
     rms_norm,
     ternary_dequant_scale,
     ternary_init,
@@ -466,13 +463,11 @@ class ZgTernaryLinear(nnx.Module):
 
 
 class IntLinear(nnx.Module):
-    """Pure-integer linear: int activations × int weights → int32 → requantize.
+    """Pure-integer linear (Appendix G / EGG).
 
-    Weights are stored as true integers (int4-in-int8, int8, …). Float is only
-    used to initialize via :func:`float_to_int` unless ``egg=True``.
-
-    With ``egg=True`` (Appendix G): init ``round(16·N(0,1))``, scale accum by
-    ``16√n``, then clip-cast to int8 — saturation is the only nonlinearity.
+    Weights init as ``round(16·N(0,1))`` clipped to ±127. Forward is int matmul,
+    scale by ``16√n``, then clip-cast to int8 — saturation is the nonlinearity.
+    Pass ``act_dtype=jnp.int32`` for logits to skip the narrow clip.
     """
 
     def __init__(
@@ -484,39 +479,24 @@ class IntLinear(nnx.Module):
         bits: int = 8,
         w_dtype: jnp.dtype | None = None,
         act_dtype: jnp.dtype | None = None,
-        out_shift: int = 8,
-        egg: bool = False,
         rngs: nnx.Rngs,
     ) -> None:
-        self.bits = int(bits)
+        del bits, w_dtype  # EGG storage is always int8 ±127.
+        self.bits = 8
         self.in_features = int(in_features)
-        self.egg = bool(egg)
-        if w_dtype is None:
-            w_dtype = jnp.int8 if bits <= 8 else (jnp.int16 if bits <= 16 else jnp.int32)
-        if act_dtype is None:
-            act_dtype = w_dtype
-        if self.egg:
-            self.kernel = nnx.Param(egg_init_matrix(rngs.params(), (in_features, out_features)))
-        else:
-            w = nnx.initializers.lecun_normal()(rngs.params(), (in_features, out_features))
-            self.kernel = nnx.Param(float_to_int(w, w_dtype, bits=bits))
+        self.kernel = nnx.Param(egg_init_matrix(rngs.params(), (in_features, out_features)))
         self.bias = (
             nnx.Param(jnp.zeros((out_features,), dtype=jnp.int32)) if use_bias else None
         )
         self.use_bias = use_bias
-        self.out_shift = int(out_shift)
-        self.act_dtype = act_dtype
-        self.w_dtype = w_dtype
+        self.act_dtype = jnp.int8 if act_dtype is None else act_dtype
+        self.w_dtype = jnp.int8
 
     def __call__(self, x: Array) -> Array:
         y = int_matmul(x, self.kernel[...])
         if self.use_bias and self.bias is not None:
             y = y + self.bias[...]
-        if self.egg:
-            return egg_requantize(y, self.in_features, act_dtype=self.act_dtype)
-        # Wider act_dtype (e.g. int32 logits) skips narrow bit clipping.
-        rq_bits = None if self.act_dtype == jnp.int32 else self.bits
-        return requantize(y, self.out_shift, self.act_dtype, bits=rq_bits)
+        return egg_requantize(y, self.in_features, act_dtype=self.act_dtype)
 
 
 class IntLUT(nnx.Module):
@@ -562,10 +542,9 @@ class IntLUT(nnx.Module):
 class IntLinearLUT(nnx.Module):
     """Core int8 block: ``int8 @ int8 → int32 → int8`` then learnable ``IntLUT``.
 
-    This is the main primitive for pure-integer networks: a GEMM / linear that
-    stays in int8 via EGG (or shift) requantize, followed by a pointwise
-    256-entry LUT nonlinearity. Surgery walks into ``linear`` / ``lut`` and
-    wraps them as :class:`ZgIntLinear` / :class:`ZgIntLUT`.
+    GEMM stays in int8 via EGG requantize, followed by a pointwise 256-entry LUT
+    nonlinearity. Surgery walks into ``linear`` / ``lut`` and wraps them as
+    :class:`ZgIntLinear` / :class:`ZgIntLUT`.
     """
 
     def __init__(
@@ -575,8 +554,6 @@ class IntLinearLUT(nnx.Module):
         *,
         use_bias: bool = False,
         bits: int = 8,
-        out_shift: int = 8,
-        egg: bool = True,
         lut_init: str = "identity",
         explore_shift: int = 0,
         rngs: nnx.Rngs,
@@ -586,8 +563,6 @@ class IntLinearLUT(nnx.Module):
             out_features,
             use_bias=use_bias,
             bits=bits,
-            out_shift=out_shift,
-            egg=egg,
             act_dtype=jnp.int8,
             rngs=rngs,
         )
@@ -622,10 +597,10 @@ class ZgIntLUT(nnx.Module):
 
 
 class IntConv(nnx.Module):
-    """Pure-integer 2-D conv: int8 NHWC × int8 ``[kH·kW·in, out]`` → requantize.
+    """Pure-integer 2-D conv (EGG): int8 NHWC × int8 ``[kH·kW·in, out]``.
 
     Kernel is stored flattened as a MATRIX leaf so ZeroGrad factor replay matches
-    :class:`IntLinear`. With ``egg=True``: EGG init + ``16√n`` scale + clip-cast.
+    :class:`IntLinear`. Init + ``16√n`` scale + clip-cast to int8.
     """
 
     def __init__(
@@ -638,10 +613,9 @@ class IntConv(nnx.Module):
         padding: str = "SAME",
         use_bias: bool = True,
         bits: int = 8,
-        out_shift: int = 8,
-        egg: bool = False,
         rngs: nnx.Rngs,
     ) -> None:
+        del bits
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         if isinstance(strides, int):
@@ -652,16 +626,10 @@ class IntConv(nnx.Module):
         self.out_features = int(out_features)
         self.strides = (int(strides[0]), int(strides[1]))
         self.padding = padding
-        self.bits = int(bits)
-        self.out_shift = int(out_shift)
-        self.egg = bool(egg)
+        self.bits = 8
         self.use_bias = bool(use_bias)
         fan_in = kh * kw * self.in_features
-        if self.egg:
-            self.kernel = nnx.Param(egg_init_matrix(rngs.params(), (fan_in, out_features)))
-        else:
-            w = nnx.initializers.lecun_normal()(rngs.params(), (fan_in, out_features))
-            self.kernel = nnx.Param(float_to_int(w, jnp.int8, bits=bits))
+        self.kernel = nnx.Param(egg_init_matrix(rngs.params(), (fan_in, out_features)))
         self.bias = (
             nnx.Param(jnp.zeros((out_features,), dtype=jnp.int32)) if use_bias else None
         )
@@ -678,9 +646,7 @@ class IntConv(nnx.Module):
         if self.use_bias and self.bias is not None:
             y = y + self.bias[...].reshape((1, 1, 1, -1))
         fan_in = kh * kw * self.in_features
-        if self.egg:
-            return egg_requantize(y, fan_in, act_dtype=jnp.int8)
-        return requantize(y, self.out_shift, jnp.int8, bits=self.bits)
+        return egg_requantize(y, fan_in, act_dtype=jnp.int8)
 
 
 class ZgIntConv(nnx.Module):
@@ -701,8 +667,6 @@ class ZgIntConv(nnx.Module):
         self.strides = conv.strides
         self.padding = conv.padding
         self.bits = conv.bits
-        self.out_shift = conv.out_shift
-        self.egg = conv.egg
         self.use_bias = conv.use_bias
         self.slot = slot
         self.kernel_group = kernel_group
@@ -745,9 +709,7 @@ class ZgIntConv(nnx.Module):
                 )
             y = y + bias.astype(jnp.int32).reshape((1, 1, 1, -1))
         fan_in = kh * kw * self.in_features
-        if self.egg:
-            return egg_requantize(y, fan_in, act_dtype=jnp.int8)
-        return requantize(y, self.out_shift, jnp.int8, bits=self.bits)
+        return egg_requantize(y, fan_in, act_dtype=jnp.int8)
 
 
 class ZgIntLinear(nnx.Module):
@@ -763,11 +725,9 @@ class ZgIntLinear(nnx.Module):
         self.kernel = linear.kernel
         self.bias = linear.bias
         self.use_bias = linear.use_bias
-        self.out_shift = linear.out_shift
         self.act_dtype = linear.act_dtype
         self.bits = linear.bits
         self.in_features = linear.in_features
-        self.egg = linear.egg
         self.slot = slot
         self.kernel_group = kernel_group
         self.bias_group = bias_group
@@ -807,47 +767,34 @@ class ZgIntLinear(nnx.Module):
                         factor_sign=slot.factor_sign[...],
                     )
             y = y + bias.astype(jnp.int32)
-        if self.egg:
-            return egg_requantize(y, self.in_features, act_dtype=self.act_dtype)
-        rq_bits = None if self.act_dtype == jnp.int32 else self.bits
-        return requantize(y, self.out_shift, self.act_dtype, bits=rq_bits)
+        return egg_requantize(y, self.in_features, act_dtype=self.act_dtype)
 
 
 class IntSpatialProj(nnx.Module):
     """Token-axis spatial projection for gMLP SGU: ``y[b,:,c] = W @ x[b,:,c] + b``.
 
-    ``W`` is ``[seq, seq]`` int4/int8. Applied as ``flat @ W`` over reshaped
+    ``W`` is ``[seq, seq]`` int8. Applied as ``flat @ W`` over reshaped
     ``[B*C, S]`` so ZeroGrad factor ops match :class:`IntLinear`.
 
-    With ``egg=True``: EGG scaled matmul + clip-cast; zero ``W`` and bias
-    ``= 16√S`` so the gate starts near multiply-by-one.
+    EGG scaled matmul + clip-cast; zero ``W`` and bias ``= 16√S`` so the gate
+    starts near multiply-by-one.
     """
 
     def __init__(
         self,
         seq_len: int,
         *,
-        bits: int = 4,
-        out_shift: int = 9,
-        egg: bool = False,
+        bits: int = 8,
         rngs: nnx.Rngs,
     ) -> None:
-        self.bits = int(bits)
+        del bits
+        self.bits = 8
         self.seq_len = int(seq_len)
-        self.out_shift = int(out_shift)
-        self.egg = bool(egg)
         del rngs  # deterministic near-identity init; ES learns the spatial mix
-        storage = jnp.int8 if bits <= 8 else (jnp.int16 if bits <= 16 else jnp.int32)
-        self.kernel = nnx.Param(jnp.zeros((seq_len, seq_len), dtype=storage))
-        if self.egg:
-            # After // (16√S) → 1, so SGU starts as channel gate ≈ identity.
-            ones_bias = egg_matmul_divisor(seq_len)
-            self.bias = nnx.Param(jnp.full((seq_len,), ones_bias, dtype=jnp.int32))
-        else:
-            # bias >> out_shift ≈ 1 so SGU starts as channel gating ≈ identity.
-            self.bias = nnx.Param(
-                jnp.full((seq_len,), 1 << int(out_shift), dtype=jnp.int32)
-            )
+        self.kernel = nnx.Param(jnp.zeros((seq_len, seq_len), dtype=jnp.int8))
+        # After // (16√S) → 1, so SGU starts as channel gate ≈ identity.
+        ones_bias = egg_matmul_divisor(seq_len)
+        self.bias = nnx.Param(jnp.full((seq_len,), ones_bias, dtype=jnp.int32))
 
     def __call__(self, x: Array) -> Array:
         """``x``: ``[B, S, C]`` → same shape, int activations."""
@@ -855,9 +802,6 @@ class IntSpatialProj(nnx.Module):
             x,
             self.kernel[...],
             self.bias[...],
-            out_shift=self.out_shift,
-            bits=self.bits,
-            egg=self.egg,
             in_features=self.seq_len,
         )
 
@@ -867,9 +811,6 @@ def _spatial_proj_forward(
     kernel: Array,
     bias: Array,
     *,
-    out_shift: int,
-    bits: int,
-    egg: bool = False,
     in_features: int | None = None,
     key: Array | None = None,
     rank: int = 1,
@@ -889,11 +830,8 @@ def _spatial_proj_forward(
         bias_key = jax.random.fold_in(key, 1)
         bias = perturbed_int_vector(bias, bias_key, sigma_shift, factor_sign=factor_sign)
     y = y + bias.astype(jnp.int32)
-    if egg:
-        n = int(in_features) if in_features is not None else s
-        y = egg_requantize(y, n, act_dtype=jnp.int8)
-    else:
-        y = requantize(y, out_shift, bits=bits)
+    n = int(in_features) if in_features is not None else s
+    y = egg_requantize(y, n, act_dtype=jnp.int8)
     return jnp.transpose(y.reshape(b, c, s), (0, 2, 1))
 
 
@@ -911,8 +849,6 @@ class ZgIntSpatialProj(nnx.Module):
         self.bias = spatial.bias
         self.bits = spatial.bits
         self.seq_len = spatial.seq_len
-        self.out_shift = spatial.out_shift
-        self.egg = spatial.egg
         self.slot = slot
         self.kernel_group = kernel_group
         self.bias_group = bias_group
@@ -942,51 +878,33 @@ class ZgIntSpatialProj(nnx.Module):
                 factor_sign=slot.factor_sign[...],
             )
         y = y + bias.astype(jnp.int32)
-        if self.egg:
-            y = egg_requantize(y, self.seq_len, act_dtype=jnp.int8)
-        else:
-            y = requantize(y, self.out_shift, bits=self.bits)
+        y = egg_requantize(y, self.seq_len, act_dtype=jnp.int8)
         return jnp.transpose(y.reshape(b, c, s), (0, 2, 1))
 
 
 class IntAffine(nnx.Module):
     """Integer centering + learned scale/bias (LayerNorm stand-in without float).
 
-    ``y = ((x - mean(x)) * scale) >> shift + bias`` with int16 scale, int activation bias.
+    ``y = ((x - mean(x)) * scale) >> shift + bias`` with int16 scale.
 
-    With ``egg=True``: scale init 16 (Appendix G.3 ``θln``) in Q4 fixed point,
-    shift 4, then clip to ±127.
+    Appendix G.3 ``θln``: scale init 16 in Q4 fixed point (shift 4), then clip
+    to ±127.
     """
 
     def __init__(
         self,
         dim: int,
         *,
-        shift: int = 8,
         bits: int = 8,
-        egg: bool = False,
         rngs: nnx.Rngs | None = None,
     ) -> None:
-        del rngs
-        self.bits = int(bits)
-        self.egg = bool(egg)
-        if self.egg:
-            from ._integer import EGG_I8_MAX, EGG_I8_MIN
-
-            self.scale = nnx.Param(jnp.full((dim,), 16, dtype=jnp.int16))
-            # Appendix-G scale parameters use Q4 fixed point: 16 represents
-            # 1.0.  Shifting by zero amplified every centered activation 16×
-            # and saturated >90% of deep-model hidden states.
-            self.shift = 4
-            self._qmin, self._qmax = EGG_I8_MIN, EGG_I8_MAX
-            storage = jnp.int8
-        else:
-            self.scale = nnx.Param(jnp.full((dim,), 1 << shift, dtype=jnp.int16))
-            self.shift = int(shift)
-            qmin, qmax = qrange(bits)
-            self._qmin, self._qmax = qmin, qmax
-            storage = jnp.int8 if bits <= 8 else jnp.int16
-        self.bias = nnx.Param(jnp.zeros((dim,), dtype=storage))
+        del rngs, bits
+        self.bits = 8
+        self.scale = nnx.Param(jnp.full((dim,), 16, dtype=jnp.int16))
+        # Appendix-G scale parameters use Q4 fixed point: 16 represents 1.0.
+        self.shift = 4
+        self._qmin, self._qmax = EGG_I8_MIN, EGG_I8_MAX
+        self.bias = nnx.Param(jnp.zeros((dim,), dtype=jnp.int8))
         # Preserve vector semantics after nnx.vmap adds a leading layer axis.
         self.scale.set_metadata(**{LAYOUT_METADATA_KEY: ParameterLayout.VECTOR.value})
         self.bias.set_metadata(**{LAYOUT_METADATA_KEY: ParameterLayout.VECTOR.value})
@@ -1004,10 +922,115 @@ class IntAffine(nnx.Module):
         )
 
 
+class IntEmbedding(nnx.Module):
+    """Pure-integer embedding table (Appendix G / EGG).
+
+    Rows init as ``round(16·N(0,1))`` clipped to ±127. Lookup is a gather; no
+    requantize is applied (table values are already int8 activations).
+
+    Surgery replaces this with :class:`ZgIntEmbedding` (row-sparse ES factors).
+    Prefer this over ``nnx.Embed`` + custom init for integer LMs.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        features: int,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        self.num_embeddings = int(num_embeddings)
+        self.features = int(features)
+        table = egg_init_matrix(rngs.params(), (self.num_embeddings, self.features))
+        self.embedding = mark_table(nnx.Param(table))
+
+    def __call__(self, indices: Array) -> Array:
+        return self.embedding[...][indices]
+
+    def attend(self, query: Array) -> Array:
+        """Tied-logit projection: ``query @ embedding.T`` in int32."""
+        return int_matmul(query, self.embedding[...].T)
+
+
+class ZgIntEmbedding(nnx.Module):
+    """``IntEmbedding`` with Appendix H row-sparse int8 table perturbations."""
+
+    def __init__(self, embed: IntEmbedding, slot: ZeroGradSlot, group: str) -> None:
+        self.embedding = embed.embedding
+        self.num_embeddings = embed.num_embeddings
+        self.features = embed.features
+        self.slot = slot
+        self.group = group
+
+    def __call__(self, indices: Array) -> Array:
+        return self.lookup(indices, factors=None)
+
+    def candidate_factors(self) -> tuple[Array, Array] | None:
+        """Generate this candidate's table factors once for reuse by a loss."""
+        slot = self.slot
+        if not slot.enabled:
+            return None
+        from ._factors import int_table_factors
+
+        return int_table_factors(
+            _factor_key(slot, self.group),
+            self.embedding[...].shape,
+            slot.rank,
+        )
+
+    def lookup(
+        self,
+        indices: Array,
+        *,
+        factors: tuple[Array, Array] | None,
+    ) -> Array:
+        """Gather rows, optionally reusing :meth:`candidate_factors` output."""
+        table = self.embedding[...]
+        slot = self.slot
+        if not slot.enabled:
+            return table[indices]
+        if factors is None:
+            return perturbed_int_table_lookup(
+                table,
+                indices,
+                _factor_key(slot, self.group),
+                slot.rank,
+                slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+        a, b = factors
+        return perturbed_int_table_lookup_prepared(
+            table,
+            indices,
+            a,
+            b,
+            slot.sigma_shift,
+            factor_sign=slot.factor_sign[...],
+        )
+
+    def attend(self, query: Array) -> Array:
+        """Tied-logit projection using the same table factors as ``__call__``."""
+        table = self.embedding[...]
+        slot = self.slot
+        if slot.enabled:
+            idx = jnp.arange(table.shape[0], dtype=jnp.int32)
+            e = perturbed_int_table_lookup(
+                table,
+                idx,
+                _factor_key(slot, self.group),
+                slot.rank,
+                slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+            return int_matmul(query, e.T)
+        return int_matmul(query, table.T)
+
+
 class ZgEmbed(nnx.Module):
     """``nnx.Embed`` replacement with factor-only table perturbations.
 
     Integer tables use Appendix H row-sparse gathers (no full ``A[V,r]`` alloc).
+    Prefer :class:`IntEmbedding` / :class:`ZgIntEmbedding` for EGG int8 LMs.
     """
 
     def __init__(self, embed: nnx.Embed, slot: ZeroGradSlot, group: str) -> None:
@@ -1246,6 +1269,7 @@ def _is_surged(module: object) -> bool:
             ZgIntLinear,
             ZgIntLUT,
             ZgIntSpatialProj,
+            ZgIntEmbedding,
             ZgTernaryLinear,
             ZgEmbed,
             ZgLayerNorm,
@@ -1386,6 +1410,13 @@ def apply_surgery(
                     ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
                 )
                 setattr(module, name, ZgIntSpatialProj(value, slot, kg, bg))
+            elif isinstance(value, IntEmbedding):
+                leaf = _path_tuple(child_path)
+                g = _path_str(child_path + ("embedding",))
+                entries.append(
+                    ManifestEntry(leaf + ("embedding",), ParameterLayout.TABLE, g)
+                )
+                setattr(module, name, ZgIntEmbedding(value, slot, g))
             elif isinstance(value, nnx.Embed):
                 leaf = _path_tuple(child_path)
                 g = _path_str(child_path + ("embedding",))
