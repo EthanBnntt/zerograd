@@ -22,13 +22,15 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ._manifest import ParameterTree
-from ._optimizer import LossFn, StepMetrics, ZeroGrad, ZeroGradState
+from ._nnx import params_pure_dict, update_params
+from ._optimizer import LossFn, ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
 
@@ -99,7 +101,7 @@ class DeviceShard:
         self,
         device: jax.Device,
         optimizer: ZeroGrad,
-        loss_fn: LossFn,
+        loss_fn: LossFn | ModelLossFn,
         name: str = "",
     ) -> None:
         self.device = device
@@ -109,7 +111,7 @@ class DeviceShard:
 
     def evaluate(
         self,
-        params: ParameterTree,
+        params: Any,
         batch: Any,
         candidate_ids: Array,
         generation: int,
@@ -119,14 +121,25 @@ class DeviceShard:
         if rng is None:
             rng = jax.random.key(0)
 
-        params_d = jax.device_put(params, self.device)
-        batch_d = jax.device_put(batch, self.device)
-        ids_d = jax.device_put(candidate_ids, self.device)
-        rng_d = jax.device_put(rng, self.device)
+        # NNX modules are not device_put-friendly as a whole; put batch/ids only.
+        from flax import nnx
 
-        losses = self._optimizer.evaluate_shard(
-            params_d, generation, self._loss_fn, batch_d, ids_d, rng=rng_d,
-        )
+        if isinstance(params, nnx.Module):
+            batch_d = jax.device_put(batch, self.device)
+            ids_d = jax.device_put(candidate_ids, self.device)
+            rng_d = jax.device_put(rng, self.device)
+            with jax.default_device(self.device):
+                losses = self._optimizer.evaluate_shard(
+                    params, generation, self._loss_fn, batch_d, ids_d, rng=rng_d,
+                )
+        else:
+            params_d = jax.device_put(params, self.device)
+            batch_d = jax.device_put(batch, self.device)
+            ids_d = jax.device_put(candidate_ids, self.device)
+            rng_d = jax.device_put(rng, self.device)
+            losses = self._optimizer.evaluate_shard(
+                params_d, generation, self._loss_fn, batch_d, ids_d, rng=rng_d,
+            )
         return ShardResult(candidate_ids=candidate_ids, losses=losses)
 
     @property
@@ -167,7 +180,7 @@ class DistributedZeroGrad:
         self,
         optimizer: ZeroGrad,
         devices: list[jax.Device],
-        loss_fn: LossFn,
+        loss_fn: LossFn | ModelLossFn,
         weights: list[float] | None = None,
         coordinator_device: jax.Device | None = None,
     ) -> None:
@@ -234,18 +247,18 @@ class DistributedZeroGrad:
         for shard, ids in zip(self._shards, id_shards):
             shard._candidate_ids = ids
 
-    def init(self, params: ParameterTree) -> ZeroGradState:
-        """Initialize optimizer state."""
-        return self._optimizer.init(params)
+    def init(self, model_or_params: Any) -> ZeroGradState:
+        """Initialize optimizer state (dict params or nnx.Module)."""
+        return self._optimizer.init(model_or_params)
 
     def step(
         self,
         state: ZeroGradState,
-        params: ParameterTree,
+        model_or_params: Any,
         batch: Any,
         *,
         rng: Array | None = None,
-    ) -> tuple[ParameterTree, ZeroGradState, StepMetrics]:
+    ) -> tuple[Any, ZeroGradState, StepMetrics]:
         """Execute one distributed optimization generation.
 
         Evaluates each shard concurrently, gathers losses in candidate-ID
@@ -264,7 +277,7 @@ class DistributedZeroGrad:
             ids = shard._candidate_ids
             if ids is not None and ids.shape[0] > 0:
                 future = self._executor.submit(
-                    shard.evaluate, params, batch, ids, gen, rng,
+                    shard.evaluate, model_or_params, batch, ids, gen, rng,
                 )
             else:
                 future = None
@@ -280,70 +293,53 @@ class DistributedZeroGrad:
             all_losses.append(losses)
         losses = jnp.concatenate(all_losses)
 
-        # Complete the step on the coordinator device
-        params_c = jax.device_put(params, self._coordinator_device)
+        from flax import nnx
+
+        if isinstance(model_or_params, nnx.Module):
+            return self._optimizer.step_from_losses(state, model_or_params, losses)
+
+        params_c = jax.device_put(model_or_params, self._coordinator_device)
         return self._optimizer.step_from_losses(state, params_c, losses)
 
     def calibrate(
         self,
-        params: ParameterTree,
+        model_or_params: Any,
         batch: Any,
         *,
         warmup: int = 1,
         trials: int = 3,
         rng: Array | None = None,
     ) -> list[CalibrationResult]:
-        """Auto-calibrate weights by timing each device.
-
-        Runs ``warmup`` evaluation rounds (to trigger JIT compilation) then
-        ``trials`` timed rounds.  Weights are set inversely proportional to
-        per-candidate evaluation time — a device that is 4× faster gets 4×
-        more candidates.
-
-        After calibration, the partition is immediately updated.  Call this
-        once before training starts, after ``init``.
-
-        Parameters:
-            params: Sample parameter tree.
-            batch: Sample batch.
-            warmup: Number of untimed warmup rounds (for JIT compilation).
-            trials: Number of timed rounds to average.
-            rng: Optional RNG key.
-        """
+        """Auto-calibrate weights by timing each device."""
         if rng is None:
             rng = jax.random.key(0)
 
         pop = self._optimizer.population_size
-        # Use a small fixed subset of candidates for calibration timing
         calib_ids = jnp.arange(min(pop, 4), dtype=jnp.int32)
         gen = 0
 
         results: list[CalibrationResult] = []
 
         for shard in self._shards:
-            dev = shard.device
-            # Warmup (JIT compilation)
             for _ in range(warmup):
-                r = shard.evaluate(params, batch, calib_ids, gen, rng)
+                r = shard.evaluate(model_or_params, batch, calib_ids, gen, rng)
                 jax.block_until_ready(r.losses)
 
-            # Timed runs
             t0 = time.perf_counter()
             for _ in range(trials):
-                r = shard.evaluate(params, batch, calib_ids, gen, rng)
+                r = shard.evaluate(model_or_params, batch, calib_ids, gen, rng)
                 jax.block_until_ready(r.losses)
             elapsed = (time.perf_counter() - t0) / trials
             per_candidate = elapsed / len(calib_ids)
 
             results.append(CalibrationResult(
-                device=dev,
+                device=shard.device,
                 name=shard.name,
                 num_candidates=len(calib_ids),
                 elapsed_seconds=elapsed,
                 per_candidate_seconds=per_candidate,
             ))
 
-        # Set weights inversely proportional to per-candidate time
         new_weights = [1.0 / r.per_candidate_seconds for r in results]
         self._weights = new_weights
         self._partition_sizes = compute_partition_sizes(pop, new_weights)
@@ -365,3 +361,228 @@ class DistributedZeroGrad:
     def partition_sizes(self) -> list[int]:
         """Number of candidates assigned to each shard."""
         return list(self._partition_sizes)
+
+
+@dataclass(slots=True)
+class _DeviceReplica:
+    device: jax.Device
+    optimizer: ZeroGrad
+    model: Any
+    state: ZeroGradState
+    candidate_ids: np.ndarray
+
+
+class ReplicatedDistributedZeroGrad:
+    """Seed-replicated, gradient-free ES across local accelerator devices.
+
+    Each GPU owns an independently initialized model/optimizer replica. Candidate
+    shards are evaluated concurrently; only the scalar loss vector is gathered
+    and broadcast. Every replica deterministically replays the same update, so
+    parameters remain synchronized without parameter, activation, or gradient
+    communication.
+    """
+
+    def __init__(
+        self,
+        *,
+        devices: list[jax.Device],
+        optimizer_factory: Callable[[], ZeroGrad],
+        model_factory: Callable[[], Any],
+        loss_fn: LossFn | ModelLossFn,
+        weights: list[float] | None = None,
+    ) -> None:
+        if not devices:
+            raise ValueError("at least one device is required")
+        if weights is not None and len(weights) != len(devices):
+            raise ValueError(
+                f"weights length ({len(weights)}) must match devices ({len(devices)})"
+            )
+
+        self._devices = list(devices)
+        self._loss_fn = loss_fn
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=len(devices)
+        )
+        self._replicas: list[_DeviceReplica] = []
+
+        population: int | None = None
+        for device in self._devices:
+            with jax.default_device(device):
+                optimizer = optimizer_factory()
+                model = model_factory()
+                state = optimizer.init(model)
+            if population is None:
+                population = optimizer.population_size
+            elif optimizer.population_size != population:
+                raise ValueError("all optimizer replicas must use the same population")
+            self._replicas.append(
+                _DeviceReplica(
+                    device=device,
+                    optimizer=optimizer,
+                    model=model,
+                    state=state,
+                    candidate_ids=np.empty((0,), dtype=np.int32),
+                )
+            )
+
+        assert population is not None
+        self._population_size = population
+        self._weights = list(weights or [1.0] * len(devices))
+        self._partition_sizes = compute_partition_sizes(population, self._weights)
+        offset = 0
+        for replica, size in zip(self._replicas, self._partition_sizes, strict=True):
+            replica.candidate_ids = np.arange(offset, offset + size, dtype=np.int32)
+            offset += size
+
+    def __enter__(self) -> "ReplicatedDistributedZeroGrad":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.shutdown()
+        return False
+
+    def shutdown(self) -> None:
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._executor = None
+
+    def _evaluate_replica(
+        self,
+        replica: _DeviceReplica,
+        batch_host: Any,
+        rng_host: Any,
+        generation: int,
+    ) -> np.ndarray:
+        with jax.default_device(replica.device):
+            batch = jax.device_put(batch_host, replica.device)
+            candidate_ids = jax.device_put(replica.candidate_ids, replica.device)
+            rng = jax.device_put(rng_host, replica.device)
+            losses = replica.optimizer.evaluate_shard(
+                replica.model,
+                generation,
+                self._loss_fn,
+                batch,
+                candidate_ids,
+                rng=rng,
+            )
+            jax.block_until_ready(losses)
+        return np.asarray(jax.device_get(losses), dtype=np.float32)
+
+    def _update_replica(
+        self,
+        replica: _DeviceReplica,
+        losses_host: np.ndarray,
+    ) -> StepMetrics:
+        with jax.default_device(replica.device):
+            losses = jax.device_put(losses_host, replica.device)
+            replica.model, replica.state, metrics = (
+                replica.optimizer.step_from_losses(
+                    replica.state,
+                    replica.model,
+                    losses,
+                )
+            )
+            # A loss metric is independent of replay; wait on params to ensure
+            # the deterministic update has completed before the next generation.
+            jax.block_until_ready(params_pure_dict(replica.model))
+        return metrics
+
+    def step(
+        self,
+        batch: Any,
+        *,
+        rng: Array | None = None,
+    ) -> tuple[Any, ZeroGradState, StepMetrics]:
+        """Evaluate shards, exchange only losses, and replay on every GPU."""
+        if self._executor is None:
+            raise RuntimeError("coordinator has been shut down")
+        if rng is None:
+            rng = jax.random.key(0)
+
+        generation = self._replicas[0].state.generation
+        if any(replica.state.generation != generation for replica in self._replicas):
+            raise RuntimeError("device replicas have diverged in generation")
+
+        batch_host = jax.device_get(batch)
+        rng_host = jax.device_get(rng)
+        eval_futures = [
+            self._executor.submit(
+                self._evaluate_replica,
+                replica,
+                batch_host,
+                rng_host,
+                generation,
+            )
+            for replica in self._replicas
+        ]
+        loss_parts = [future.result() for future in eval_futures]
+        losses_host = np.concatenate(loss_parts, axis=0)
+        if losses_host.shape != (self._population_size,):
+            raise RuntimeError(
+                f"gathered losses have shape {losses_host.shape}, "
+                f"expected {(self._population_size,)}"
+            )
+
+        update_futures = [
+            self._executor.submit(self._update_replica, replica, losses_host)
+            for replica in self._replicas
+        ]
+        metrics = [future.result() for future in update_futures]
+        return self._replicas[0].model, self._replicas[0].state, metrics[0]
+
+    @property
+    def model(self) -> Any:
+        return self._replicas[0].model
+
+    @property
+    def state(self) -> ZeroGradState:
+        return self._replicas[0].state
+
+    @property
+    def devices(self) -> list[jax.Device]:
+        return list(self._devices)
+
+    @property
+    def partition_sizes(self) -> list[int]:
+        return list(self._partition_sizes)
+
+    @property
+    def losses_bytes_per_step(self) -> int:
+        # One gather plus one full loss-vector broadcast per replica.
+        return self._population_size * np.dtype(np.float32).itemsize * (
+            1 + len(self._replicas)
+        )
+
+    def verify_sync(self) -> bool:
+        """Expensive debug check that all replicated parameter arrays match."""
+        reference = [
+            np.asarray(jax.device_get(value))
+            for value in jax.tree.leaves(params_pure_dict(self._replicas[0].model))
+        ]
+        for replica in self._replicas[1:]:
+            leaves = jax.tree.leaves(params_pure_dict(replica.model))
+            if len(leaves) != len(reference):
+                return False
+            for expected, value in zip(reference, leaves, strict=True):
+                if not np.array_equal(expected, np.asarray(jax.device_get(value))):
+                    return False
+        return True
+
+    def restore_params(self, params: Any, *, generation: int) -> None:
+        """Restore identical pure params on every replica (one-time checkpoint load)."""
+        if generation < 0:
+            raise ValueError("generation must be non-negative")
+        for replica in self._replicas:
+            if replica.state.opt_state is not None:
+                raise ValueError(
+                    "restore_params currently supports stateless/bin-update optimizers"
+                )
+            with jax.default_device(replica.device):
+                params_device = jax.tree.map(
+                    lambda value: jax.device_put(value, replica.device),
+                    params,
+                )
+                update_params(replica.model, params_device)
+                replica.state = ZeroGradState(generation=generation, opt_state=None)
+                jax.block_until_ready(params_pure_dict(replica.model))

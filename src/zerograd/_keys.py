@@ -55,4 +55,9 @@ def candidate_key(base_key: Array, candidate_id: int | Array) -> Array:
 
 def group_key(candidate: Array, manifest: Manifest, group: str) -> Array:
     """Derive a manifest-order-stable key for one selected parameter group."""
-    return jax.random.split(candidate, len(manifest.entries))[manifest.group_index(group)]
+    # ``random.split(candidate, n)[i]`` generates all ``n`` keys for every
+    # parameter access.  A model with n manifest entries therefore did O(n²)
+    # Threefry work per candidate forward.  ``fold_in`` directly derives the
+    # selected group in O(1); replay calls this same function, so forward/replay
+    # identity is preserved.
+    return jax.random.fold_in(candidate, manifest.group_index(group))

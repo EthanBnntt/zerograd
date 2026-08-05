@@ -34,8 +34,14 @@ def shape_centered_loss(losses: Array, sigma: float) -> Array:
     return jnp.asarray(-(centered) / (population_size * sigma), dtype=losses.dtype)
 
 
-def validate_losses(losses: Array) -> None:
-    """Reject non-scalar per-member losses before optimizer state advances."""
+def validate_losses(losses: Array, *, check_finite: bool = True) -> None:
+    """Reject invalid per-member loss arrays before optimizer state advances.
+
+    ``check_finite=False`` skips the device-to-host synchronization needed to
+    turn the finite reduction into a Python exception.  Long-running compiled
+    training loops can disable it after a validated warmup and keep the next
+    generation queued on the GPU.
+    """
     if losses.ndim != 1:
         raise ValueError(f"losses must be one-dimensional, got shape {losses.shape}")
     if losses.shape[0] < 2:
@@ -44,5 +50,5 @@ def validate_losses(losses: Array) -> None:
         raise TypeError(
             f"losses must be a floating-point array, got dtype {losses.dtype}"
         )
-    if not jnp.all(jnp.isfinite(losses)):
+    if check_finite and not jnp.all(jnp.isfinite(losses)):
         raise ValueError("candidate losses must be finite")
