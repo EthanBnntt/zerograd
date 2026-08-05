@@ -11,7 +11,6 @@ license = "MIT"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -20,6 +19,7 @@ dependencies = [
     # CPU jaxlib by default. Pick exactly one GPU extra for CUDA / ROCm.
     "jax>=0.10.2",
     "optax>=0.2.8",
+    "flax>=0.12.0",
 ]
 
 [project.optional-dependencies]
