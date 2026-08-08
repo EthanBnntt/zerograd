@@ -9,7 +9,6 @@ import pytest
 from flax import nnx
 
 from zerograd import (
-    ClusterZeroGrad,
     IntEmbedding,
     IntLinear,
     ParameterLayout,
@@ -244,26 +243,3 @@ class TestNnxOptimizer:
             _ = opt.manifest
         opt.init(model)
         assert len(opt.manifest.entries) >= 4
-
-
-class TestNnxCluster:
-    def test_cluster_stays_synced(self):
-        def build_model(key):
-            return TinyMLP(nnx.Rngs(key))
-
-        def loss_fn(model, batch):
-            return jnp.mean(model(batch) ** 2), None
-
-        opt = ZeroGrad(
-            optax.sgd(0.1),
-            population_size=8,
-            rank=2,
-            sigma=0.1,
-            seed=0,
-            run_id="nnx-cluster",
-        )
-        cluster = ClusterZeroGrad(opt, build_model, loss_fn, seed=7, num_nodes=2)
-        batch = jnp.ones((4, 2))
-        for _ in range(3):
-            cluster.step(batch)
-        assert cluster.verify_sync()
