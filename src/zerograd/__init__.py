@@ -1,5 +1,11 @@
 """JAX + Optax primitives for zero-gradient evolutionary optimization."""
 
+from ._bin_updates import (
+    apply_bin_updates,
+    apply_bin_updates_jit,
+    bin_update_threshold,
+    threshold_tree_for_manifest,
+)
 from ._cluster import ClusterZeroGrad, ZeroGradNode
 from ._distributed import (
     CalibrationResult,
@@ -10,9 +16,8 @@ from ._distributed import (
     compute_partition_sizes,
 )
 from ._fault_tolerant import FaultTolerantCluster, NodeStatus
-from ._fitness import shape_centered_loss, validate_losses
-from ._keys import candidate_key, group_key, step_key
-from ._manifest import Manifest, ManifestEntry, ParameterLayout, ParameterPath, ParameterTree
+from ._fitness import shape_antithetical_loss, shape_centered_loss, validate_losses
+from ._fused_lut import fused_linear_lut, int_linear_lut_fused
 from ._integer import (
     egg_clip_cast,
     egg_init_matrix,
@@ -24,6 +29,14 @@ from ._integer import (
     int_conv2d_flat,
     int_matmul,
 )
+from ._keys import candidate_key, group_key, step_key
+from ._manifest import (
+    Manifest,
+    ManifestEntry,
+    ParameterLayout,
+    ParameterPath,
+    ParameterTree,
+)
 from ._nnx import (
     IntAffine,
     IntConv,
@@ -32,6 +45,7 @@ from ._nnx import (
     IntLinearLUT,
     IntLUT,
     TernaryLinear,
+    ZeroGradSlot,
     ZgConv,
     ZgEmbed,
     ZgIntConv,
@@ -43,18 +57,10 @@ from ._nnx import (
     ZgTable,
     ZgTernaryLinear,
     ZgVector,
-    ZeroGradSlot,
     apply_surgery,
     mark_table,
 )
 from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
-from ._eggroll_h import (
-    apply_bin_updates,
-    apply_bin_updates_jit,
-    bin_update_threshold,
-    shape_antithetical_loss,
-    threshold_tree_for_manifest,
-)
 
 __all__ = [
     "CalibrationResult",
@@ -65,40 +71,39 @@ __all__ = [
     "IntAffine",
     "IntConv",
     "IntEmbedding",
+    "IntLUT",
     "IntLinear",
     "IntLinearLUT",
-    "IntLUT",
     "Manifest",
     "ManifestEntry",
     "ModelLossFn",
     "NodeStatus",
     "ParameterLayout",
-    "ReplicatedDistributedZeroGrad",
     "ParameterPath",
     "ParameterTree",
+    "ReplicatedDistributedZeroGrad",
     "ShardResult",
     "StepMetrics",
     "TernaryLinear",
+    "ZeroGrad",
+    "ZeroGradNode",
+    "ZeroGradSlot",
+    "ZeroGradState",
     "ZgConv",
     "ZgEmbed",
     "ZgIntConv",
     "ZgIntEmbedding",
-    "ZgIntLinear",
     "ZgIntLUT",
+    "ZgIntLinear",
     "ZgLayerNorm",
     "ZgLinear",
     "ZgTable",
     "ZgTernaryLinear",
     "ZgVector",
-    "ZeroGrad",
-    "ZeroGradNode",
-    "ZeroGradSlot",
-    "ZeroGradState",
     "apply_bin_updates",
     "apply_bin_updates_jit",
     "apply_surgery",
     "bin_update_threshold",
-    "threshold_tree_for_manifest",
     "candidate_key",
     "compute_partition_sizes",
     "egg_clip_cast",
@@ -106,14 +111,17 @@ __all__ = [
     "egg_requantize",
     "float_to_egg_i8",
     "float_to_int",
+    "fused_linear_lut",
     "group_key",
     "int_avg_pool2d",
     "int_conv2d",
     "int_conv2d_flat",
+    "int_linear_lut_fused",
     "int_matmul",
     "mark_table",
     "shape_antithetical_loss",
     "shape_centered_loss",
     "step_key",
+    "threshold_tree_for_manifest",
     "validate_losses",
 ]
