@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import inspect
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -13,23 +13,27 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from ._eggroll_h import (
-    antithetical_pair_id,
-    antithetical_sign,
+from ._bin_updates import (
     apply_bin_updates,
-    shape_antithetical_loss,
     threshold_tree_for_manifest,
     update_alpha_schedule,
 )
-from ._fitness import shape_centered_loss, validate_losses
+from ._fitness import (
+    antithetical_pair_id,
+    antithetical_sign,
+    shape_antithetical_loss,
+    shape_centered_loss,
+    validate_losses,
+)
 from ._integer import float_view_tree, qrange, snap_tree_to_integer
 from ._keys import candidate_key, step_key
 from ._manifest import Manifest, ParameterTree
 from ._nnx import (
-    ZeroGradSlot,
     apply_surgery,
     bind_candidate,
     disable_candidates,
+    model_zg_slot,
+    optional_model_zg_slot,
     params_pure_dict,
     update_params,
 )
@@ -217,9 +221,7 @@ class ZeroGrad:
         """
         if isinstance(model_or_params, nnx.Module):
             model = model_or_params
-            already = hasattr(model, "zg_slot") and isinstance(
-                getattr(model, "zg_slot", None), ZeroGradSlot
-            )
+            already = optional_model_zg_slot(model) is not None
             if not already:
                 model, auto_manifest = apply_surgery(
                     model,
@@ -232,8 +234,7 @@ class ZeroGrad:
                 # group strings stay consistent with Manifest.entries.
                 self._manifest = auto_manifest
             else:
-                slot = getattr(model, "zg_slot")
-                assert isinstance(slot, ZeroGradSlot)
+                slot = model_zg_slot(model)
                 if self._manifest is None:
                     if slot.manifest is None:
                         raise ValueError(
@@ -243,8 +244,7 @@ class ZeroGrad:
                     self._manifest = slot.manifest
                 else:
                     slot.manifest = self._manifest
-            slot = getattr(model, "zg_slot")
-            assert isinstance(slot, ZeroGradSlot)
+            slot = model_zg_slot(model)
             slot.rank = self._rank
             slot.sigma = self._sigma
             slot.sigma_shift = self._sigma_shift
@@ -429,11 +429,11 @@ class ZeroGrad:
             base_key,
         )
 
-    def _jit_update_bin_params(self, params: ParameterTree, thresholds: ParameterTree):
+    def _jit_update_bin_params(self, params: ParameterTree):
         """JIT the bin-update path once per params shape (cached on the instance).
 
-        Thresholds are folded as static Python ints (not traced) so the jitted
-        function only takes array arguments.
+        Thresholds are traced arguments (not closed over) so ``update_alpha`` /
+        ``alpha_decay`` changes take effect every generation.
         """
         if not hasattr(self, "_bin_update_jit_cache"):
             self._bin_update_jit_cache: dict = {}
@@ -443,11 +443,11 @@ class ZeroGrad:
         if jit_fn is None:
             qmin, qmax = qrange(self._int_bits)
 
-            def _update(params_p, evidence_p):
+            def _update(params_p, evidence_p, thresholds_p):
                 return apply_bin_updates(
                     params_p,
                     evidence_p,
-                    thresholds,
+                    thresholds_p,
                     qmin=qmin,
                     qmax=qmax,
                 )
@@ -573,9 +573,9 @@ class ZeroGrad:
         assert self._manifest is not None
         generation = state.generation
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
+        half = self._population_size // 2
 
         if self._bin_updates or self._int_bin_updates:
-            half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
             alpha = update_alpha_schedule(
                 generation, base=self._update_alpha, decay=self._alpha_decay
@@ -587,6 +587,7 @@ class ZeroGrad:
                 self._manifest,
                 alpha=alpha_clip,
                 num_directions=half,
+                rank=self._rank,
             )
             if self._bin_updates:
                 # Pure integer path: compile replay and update together so the
@@ -600,8 +601,8 @@ class ZeroGrad:
                     params, self._manifest, base_key, pair_ids, shaped, self._rank
                 )
                 # Mixed path also needs float-leaf evidence below.
-                update_fn = self._jit_update_bin_params(params, thresholds)
-                new_params = update_fn(params, evidence)
+                update_fn = self._jit_update_bin_params(params)
+                new_params = update_fn(params, evidence, thresholds)
                 # Mixed int bins + AdamW: bin-flip integer leaves, Adam float leaves.
                 shaped_f = shape_centered_loss(losses, self._sigma)
                 pair_weights = shaped_f[:half] - shaped_f[half:]
@@ -616,7 +617,6 @@ class ZeroGrad:
                     mask_integers_against=new_params,
                 )
         elif self._integer_es:
-            half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
             shaped = shape_centered_loss(losses, self._sigma)
             pair_weights = shaped[:half] - shaped[half:]
@@ -636,7 +636,6 @@ class ZeroGrad:
 
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
         if self._population_size % 2 == 0:
-            half = self._population_size // 2
             pair_margin = jnp.mean(jnp.abs(losses[:half] - losses[half:]))
         else:
             pair_margin = jnp.asarray(jnp.nan, dtype=losses.dtype)
@@ -816,7 +815,7 @@ def _apply_negation(
 ) -> None:
     """Walk the parameter tree, negating manifest entries and zeroing others."""
     for key, value in params.items():
-        current_path = path + (key,)
+        current_path = (*path, key)
         if isinstance(value, Mapping):
             sub_out: dict = {}
             _apply_negation(value, current_path, descent, sub_out)
