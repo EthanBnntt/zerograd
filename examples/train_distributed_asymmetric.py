@@ -101,7 +101,7 @@ def main():
     print(f"Model: {INPUT_DIM}→{HIDDEN_DIM}→{OUTPUT_DIM}, pop={args.pop}, batch={args.batch}")
     print(f"Steps: {args.steps}")
 
-    model = BigMLP(nnx.Rngs(0))
+    BigMLP(nnx.Rngs(0))
     batch = (
         jax.random.normal(jax.random.key(1), (args.batch, INPUT_DIM)),
         jax.random.randint(jax.random.key(2), (args.batch,), 0, OUTPUT_DIM),
