@@ -192,7 +192,7 @@ def _int_table_evidence(
     while keeping all work on GPU (no Python per-row loop).
     """
     rows, cols = int(parameter.shape[0]), int(parameter.shape[1])
-    tile = _TABLE_ROW_TILE if rows > _TABLE_ROW_TILE else rows
+    tile = min(rows, _TABLE_ROW_TILE)
     n_tiles = (rows + tile - 1) // tile
 
     def factors_for_pair(pid):
@@ -226,9 +226,9 @@ def replay(
     candidate_ids: Array,
     shaped_weights: Array,
     rank: int,
-) -> dict[str, "jax.Array | dict"]:
+) -> dict[str, jax.Array | dict]:
     """Reconstruct the full parameter-space descent direction for all manifest entries."""
-    result: dict[str, "jax.Array | dict"] = {}
+    result: dict[str, jax.Array | dict] = {}
     for entry in manifest.entries:
         leaf = replay_entry(params, manifest, entry.path, base_key, candidate_ids, shaped_weights, rank)
         _insert_nested(result, entry.path, leaf)
@@ -242,9 +242,9 @@ def replay_integer(
     pair_ids: Array,
     shaped_weights: Array,
     rank: int,
-) -> dict[str, "jax.Array | dict"]:
+) -> dict[str, jax.Array | dict]:
     """Appendix H.3 int32 evidence tree for discrete bin updates."""
-    result: dict[str, "jax.Array | dict"] = {}
+    result: dict[str, jax.Array | dict] = {}
     for entry in manifest.entries:
         leaf = replay_entry_integer(
             params, manifest, entry.path, base_key, pair_ids, shaped_weights, rank
@@ -253,7 +253,7 @@ def replay_integer(
     return result
 
 
-def _insert_nested(tree: dict, path: tuple[str, ...], value: "jax.Array") -> None:
+def _insert_nested(tree: dict, path: tuple[str, ...], value: jax.Array) -> None:
     """Insert a value at a nested tuple path into a dict tree."""
     node = tree
     for part in path[:-1]:
