@@ -17,3 +17,7 @@ htmlcov/
 
 # Planning artifacts
 .rpiv/
+
+# Local outputs and ad-hoc scripts (not part of the package)
+results/
+scripts/
