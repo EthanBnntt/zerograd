@@ -139,10 +139,8 @@ for step in range(steps):
 
 Workers can be mixed across CPU and GPU, or multiple shards can share a
 single GPU. For a 4× GPU node, pass all four devices — each gets a quarter
-of the population. See `examples/train_distributed_cpu_gpu.py` and
-`examples/train_distributed_dual_worker.py` for runnable demos (both are
-thin wrappers around `examples/train_distributed_xor.py --devices ...`,
-which takes an arbitrary comma-separated device/weight topology).
+of the population. See `examples/train_distributed_xor.py --layout cpu_gpu`
+or `--layout dual_gpu` (or `--devices …` for an arbitrary topology).
 
 For asymmetric compute (slow CPU + fast GPU, or mixed GPU generations),
 pass ``weights`` to assign more candidates to faster devices:
@@ -175,8 +173,8 @@ for step in range(steps):
     assert cluster.verify_sync()  # all nodes have identical params
 ```
 
-See `examples/train_cluster_seed_derived.py` (in-process) and
-`examples/train_cluster_multiprocess.py` (true multi-process) for demos.
+See `examples/train_cluster_xor.py --mode seed` (in-process) and
+`--mode multiprocess` (true multi-process) for demos.
 
 ### Fault-tolerant cluster (node death, late join, pause/resume)
 
@@ -202,7 +200,7 @@ assert cluster.verify_sync()  # all nodes have identical params
 
 The coordinator stores a loss history log so any node can catch up by
 replaying missed generations — no param communication needed. See
-`examples/train_cluster_unreliable.py` for a simulated churn scenario.
+`examples/train_cluster_xor.py --mode unreliable` for a simulated churn scenario.
 
 ## Development
 
