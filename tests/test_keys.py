@@ -3,7 +3,14 @@
 import jax.numpy as jnp
 import pytest
 
-from zerograd import Manifest, ManifestEntry, ParameterLayout, candidate_key, group_key, step_key
+from zerograd import (
+    Manifest,
+    ManifestEntry,
+    ParameterLayout,
+    candidate_key,
+    group_key,
+    step_key,
+)
 
 
 def _make_manifest():
@@ -17,37 +24,37 @@ def _make_manifest():
 
 
 class TestStepKey:
-    def test_seed_must_be_integer(self):
-        with pytest.raises(TypeError):
-            step_key(1.5, "run", 0, 1)
+    @pytest.mark.parametrize("seed,exc", [
+        (1.5, TypeError),
+        (True, TypeError),
+    ])
+    def test_seed_validation(self, seed, exc):
+        with pytest.raises(exc):
+            step_key(seed, "run", 0, 1)
 
-    def test_seed_must_not_be_bool(self):
-        with pytest.raises(TypeError):
-            step_key(True, "run", 0, 1)
+    @pytest.mark.parametrize("run_id,exc", [
+        ("", ValueError),
+        (None, ValueError),
+    ])
+    def test_run_id_validation(self, run_id, exc):
+        with pytest.raises(exc):
+            step_key(42, run_id, 0, 1)
 
-    def test_run_id_must_be_nonempty(self):
-        with pytest.raises(ValueError):
-            step_key(42, "", 0, 1)
+    @pytest.mark.parametrize("generation,exc", [
+        (-1, ValueError),
+        (1.5, ValueError),
+    ])
+    def test_generation_validation(self, generation, exc):
+        with pytest.raises(exc):
+            step_key(42, "run", generation, 1)
 
-    def test_run_id_must_be_string(self):
-        with pytest.raises(ValueError):
-            step_key(42, None, 0, 1)
-
-    def test_generation_must_be_non_negative(self):
-        with pytest.raises(ValueError):
-            step_key(42, "run", -1, 1)
-
-    def test_generation_must_be_integer(self):
-        with pytest.raises(ValueError):
-            step_key(42, "run", 1.5, 1)
-
-    def test_manifest_version_must_be_positive(self):
-        with pytest.raises(ValueError):
-            step_key(42, "run", 0, 0)
-
-    def test_manifest_version_must_be_integer(self):
-        with pytest.raises(ValueError):
-            step_key(42, "run", 0, 1.5)
+    @pytest.mark.parametrize("version,exc", [
+        (0, ValueError),
+        (1.5, ValueError),
+    ])
+    def test_manifest_version_validation(self, version, exc):
+        with pytest.raises(exc):
+            step_key(42, "run", 0, version)
 
     def test_key_is_deterministic_for_same_inputs(self):
         k1 = step_key(42, "run", 3, 1)
@@ -93,15 +100,15 @@ class TestCandidateKey:
         k1 = candidate_key(base, 1)
         assert not jnp.array_equal(k0, k1)
 
-    def test_non_scalar_array_candidate_rejected(self):
+    @pytest.mark.parametrize("candidate,exc", [
+        (jnp.asarray([0, 1]), TypeError),
+        (jnp.asarray(1.5), TypeError),
+        (jnp.asarray(-5), ValueError),
+    ])
+    def test_array_candidate_validation(self, candidate, exc):
         base = step_key(42, "run", 0, 1)
-        with pytest.raises(TypeError):
-            candidate_key(base, jnp.asarray([0, 1]))
-
-    def test_non_integer_array_candidate_rejected(self):
-        base = step_key(42, "run", 0, 1)
-        with pytest.raises(TypeError):
-            candidate_key(base, jnp.asarray(1.5))
+        with pytest.raises(exc):
+            candidate_key(base, candidate)
 
 
 class TestGroupKey:
