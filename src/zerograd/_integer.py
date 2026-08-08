@@ -37,7 +37,7 @@ def egg_matmul_divisor(in_features: int) -> int:
     """EGG ``@`` scale: ``16 * √n`` (Appendix G.4), integer divisor ≥ 1."""
     if in_features < 1:
         raise ValueError(f"in_features must be positive, got {in_features}")
-    return max(1, int(round(16.0 * math.sqrt(float(in_features)))))
+    return max(1, round(16.0 * math.sqrt(float(in_features))))
 
 
 def egg_requantize(
