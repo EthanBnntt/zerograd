@@ -57,7 +57,7 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["tests"]
+pythonpath = ["tests", "examples"]
 
 [dependency-groups]
 dev = [
