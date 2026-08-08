@@ -20,7 +20,12 @@ import optax
 from flax import nnx
 
 from zerograd import IntLinear, ZeroGrad, ZgIntLinear
-from zerograd._integer import float_to_int, float_view_tree, int_relu, snap_tree_to_integer
+from zerograd._integer import (
+    float_to_int,
+    float_view_tree,
+    int_relu,
+    snap_tree_to_integer,
+)
 from zerograd._nnx import params_pure_dict
 
 
@@ -233,7 +238,7 @@ class TestIntegerEsAdamLearns:
         after = params_pure_dict(model)
         changed = sum(
             int(jnp.sum(a != b))
-            for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(after))
+            for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True)
         )
         assert changed > 0, "Adam-snap path did not change any integer weights"
 
