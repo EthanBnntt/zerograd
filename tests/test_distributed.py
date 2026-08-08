@@ -4,20 +4,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from _tiny import make_model, make_opt
+from _tiny import mse_loss as _loss_fn
 from flax import nnx
-from zerograd._nnx import params_pure_dict
 
-from _tiny import make_model, make_opt, mse_loss as _loss_fn
 from zerograd import (
     CalibrationResult,
     DeviceShard,
     DistributedZeroGrad,
     IntLinear,
-    ShardResult,
     ReplicatedDistributedZeroGrad,
+    ShardResult,
     ZeroGrad,
     compute_partition_sizes,
 )
+from zerograd._nnx import params_pure_dict
 
 
 def _model():
@@ -175,7 +176,7 @@ class TestDistributedStep:
         model = _model()
         state = opt.init(model)
         batch = jnp.ones((3, 4))
-        ref_model, ref_state, _ = opt.step(state, model, batch, _loss_fn)
+        ref_model, _ref_state, _ = opt.step(state, model, batch, _loss_fn)
 
         coord = DistributedZeroGrad(opt, [_a_device()], _loss_fn)
         dstate = coord.init(model)
@@ -183,19 +184,35 @@ class TestDistributedStep:
 
         assert new_state.generation == 1
         assert metrics.population_size == 8
-        for a, b in zip(jax.tree_util.tree_leaves(params_pure_dict(new_model)), jax.tree_util.tree_leaves(params_pure_dict(ref_model))):
+        for a, b in zip(jax.tree_util.tree_leaves(params_pure_dict(new_model)), jax.tree_util.tree_leaves(params_pure_dict(ref_model)), strict=True):
             np_allclose(a, b)
 
     def test_multi_device_step_matches_single_device(self):
         opt = _make_opt(pop=8)
         model = _model()
+        state = opt.init(model)
         batch = jnp.ones((3, 4))
+        ref_model, _, _ = opt.step(state, model, batch, _loss_fn)
 
-        coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn)
-        dstate = coord.init(model)
-        new_model, new_state, _ = coord.step(dstate, model, batch)
+        model2 = _model()
+        coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn, weights=[1.0, 3.0])
+        dstate = coord.init(model2)
+        got_model, new_state, _ = coord.step(dstate, model2, batch)
         assert new_state.generation == 1
-        assert bool(jnp.all(jnp.isfinite(params_pure_dict(new_model)["l"]["kernel"])))
+        np_allclose(params_pure_dict(got_model)["l"]["kernel"], params_pure_dict(ref_model)["l"]["kernel"])
+
+    def test_uneven_split_matches_single_device(self):
+        opt = _make_opt(pop=7)
+        model = _model()
+        state = opt.init(model)
+        batch = jnp.ones((3, 4))
+        ref_model, _, _ = opt.step(state, model, batch, _loss_fn)
+
+        model2 = _model()
+        coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn, weights=[1.0, 2.0])
+        dstate = coord.init(model2)
+        got_model, _, _ = coord.step(dstate, model2, batch)
+        np_allclose(params_pure_dict(got_model)["l"]["kernel"], params_pure_dict(ref_model)["l"]["kernel"])
 
     def test_weighted_partition_step(self):
         opt = _make_opt(pop=8)
@@ -268,6 +285,18 @@ class TestCalibrate:
         assert r.elapsed_seconds > 0
         assert r.per_candidate_seconds > 0
         assert r.device is coord.shards[0].device
+
+    def test_step_is_consistent_after_calibration(self):
+        opt = _make_opt(pop=8)
+        coord = DistributedZeroGrad(opt, [_a_device(), _a_device()], _loss_fn)
+        model = _model()
+        opt.init(model)
+        coord.calibrate(model, jnp.ones((3, 4)), warmup=0, trials=1)
+        dstate = coord.init(model)
+        new_model, new_state, _ = coord.step(dstate, model, jnp.ones((3, 4)))
+        assert new_state.generation == 1
+        assert bool(jnp.all(jnp.isfinite(params_pure_dict(new_model)["l"]["kernel"])))
+        assert sum(coord.partition_sizes) == 8
 
 
 def np_allclose(a, b):
