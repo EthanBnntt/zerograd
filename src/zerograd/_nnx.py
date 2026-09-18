@@ -9,7 +9,8 @@ from stable graph paths for deterministic replay.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -36,9 +37,12 @@ from ._integer import (
     int_conv2d_flat,
     int_matmul,
     int_mean,
+    pack_ternary,
     rms_norm,
     ternary_dequant_scale,
     ternary_init,
+    ternary_requantize,
+    unpack_ternary,
 )
 from ._keys import group_key
 from ._manifest import Manifest, ManifestEntry, ParameterLayout, ParameterTree
@@ -46,6 +50,7 @@ from ._manifest import Manifest, ManifestEntry, ParameterLayout, ParameterTree
 Array = jax.Array
 
 LAYOUT_METADATA_KEY = "zerograd_layout"
+INT_BITS_METADATA_KEY = "zerograd_int_bits"
 
 
 def mark_table(param: nnx.Param) -> nnx.Param:
@@ -54,6 +59,44 @@ def mark_table(param: nnx.Param) -> nnx.Param:
         raise TypeError("mark_table expects an nnx.Param")
     param.set_metadata(**{LAYOUT_METADATA_KEY: ParameterLayout.TABLE.value})
     return param
+
+
+def mark_ternary(param: nnx.Param) -> nnx.Param:
+    """Tag an int8 ``nnx.Param`` as ternary (``bits=2`` → snap to ``{-1,0,1}``).
+
+    ZeroGrad reads this metadata at ``init`` to build a per-leaf integer-range
+    tree, so a mixed model (int8 convs / LUTs at ``[-128,127]`` alongside
+    ternary kernels at ``{-1,0,1}``) snaps and bin-flips each leaf into its own
+    range instead of one global ``int_bits``.
+    """
+    if not isinstance(param, nnx.Param):
+        raise TypeError("mark_ternary expects an nnx.Param")
+    if param[...].dtype != jnp.int8:
+        raise TypeError(f"mark_ternary expects an int8 leaf, got {param[...].dtype}")
+    param.set_metadata(**{INT_BITS_METADATA_KEY: 2})
+    return param
+
+
+def _int_bits_from_param(param: nnx.Param) -> int | None:
+    """Return the per-leaf integer bit-width metadata, or ``None`` if unset."""
+    if param.has_metadata(INT_BITS_METADATA_KEY):
+        return int(param.get_metadata(INT_BITS_METADATA_KEY))
+    return None
+
+
+def collect_int_bits_by_path(model: nnx.Module) -> dict[tuple[str, ...], int]:
+    """Map ``zerograd_int_bits``-marked params to their pure-dict paths.
+
+    Keys are stringified path tuples matching :func:`params_pure_dict`, so the
+    optimizer can build a per-leaf range tree aligned with the param tree.
+    """
+    out: dict[tuple[str, ...], int] = {}
+    for path, variable in nnx.to_flat_state(nnx.state(model, nnx.Param)):
+        if isinstance(variable, nnx.Param):
+            bits = _int_bits_from_param(variable)
+            if bits is not None:
+                out[tuple(str(p) for p in path)] = bits
+    return out
 
 
 def _layout_from_param(param: nnx.Param) -> ParameterLayout:
@@ -95,6 +138,19 @@ def _path_tuple(path: tuple[Any, ...]) -> tuple[str, ...]:
     return tuple(str(p) for p in path)
 
 
+def _append_entry(
+    entries: list[ManifestEntry],
+    leaf: tuple[str, ...],
+    name: str,
+    layout: ParameterLayout,
+    child_path: tuple[Any, ...],
+) -> str:
+    """Append a leaf ManifestEntry and return its group string."""
+    group = _path_str((*child_path, name))
+    entries.append(ManifestEntry((*leaf, name), layout, group))
+    return group
+
+
 class ZeroGradSlot(nnx.Module):
     """Shared candidate binding for all surged layers on one model."""
 
@@ -114,6 +170,25 @@ class ZeroGradSlot(nnx.Module):
         self.integer_es: bool = bool(integer_es)
         self.factor_sign = nnx.Variable(jnp.int32(1))
         self.manifest: Manifest | None = None
+
+
+class _ZeroGradSlotHost(Protocol):
+    zg_slot: ZeroGradSlot
+
+
+def model_zg_slot(model: nnx.Module) -> ZeroGradSlot:
+    return cast(_ZeroGradSlotHost, model).zg_slot
+
+
+def set_model_zg_slot(model: nnx.Module, slot: ZeroGradSlot) -> None:
+    cast(_ZeroGradSlotHost, model).zg_slot = slot
+
+
+def optional_model_zg_slot(model: nnx.Module) -> ZeroGradSlot | None:
+    if not hasattr(model, "zg_slot"):
+        return None
+    slot = cast(_ZeroGradSlotHost, model).zg_slot
+    return slot if isinstance(slot, ZeroGradSlot) else None
 
 
 class LayerIndex(nnx.Variable):
@@ -142,7 +217,7 @@ def _stacked_layer_index(value: Array, base_ndim: int) -> LayerIndex | None:
 
 
 def _table_candidate_factors(
-    table: Array, slot: "ZeroGradSlot", group: str
+    table: Array, slot: ZeroGradSlot, group: str
 ) -> tuple[Array, Array] | None:
     """Generate this candidate's table factors once for reuse by a loss.
 
@@ -165,7 +240,7 @@ def _table_candidate_factors(
 def _table_lookup(
     table: Array,
     indices: Array,
-    slot: "ZeroGradSlot",
+    slot: ZeroGradSlot,
     group: str,
     factors: tuple[Array, Array] | None = None,
 ) -> Array:
@@ -201,7 +276,7 @@ def _table_lookup(
 
 
 def _table_attend(
-    table: Array, query: Array, slot: "ZeroGradSlot", group: str
+    table: Array, query: Array, slot: ZeroGradSlot, group: str
 ) -> Array:
     """Tied-logit projection using the same table factors as lookup."""
     if jnp.issubdtype(table.dtype, jnp.integer):
@@ -221,7 +296,7 @@ def _table_attend(
 
 def _maybe_perturb_vector(
     value: Array,
-    slot: "ZeroGradSlot",
+    slot: ZeroGradSlot,
     group: str | None,
     *,
     layer_index: LayerIndex | None = None,
@@ -591,6 +666,43 @@ class IntLinear(nnx.Module):
         return egg_requantize(y, self.in_features, act_dtype=self.act_dtype)
 
 
+class TernaryIntLinear(nnx.Module):
+    """Pure-integer ternary linear: ``int8 @ {-1,0,+1}`` → ``int32`` → ``int8``.
+
+    Like :class:`IntLinear` but the kernel inits as absmean ternary ``{-1,0,1}``
+    (marked ``bits=2`` via :func:`mark_ternary`) and the accumulator is scaled
+    by :func:`ternary_requantize` (``√K``) instead of EGG's ``16√K`` — the EGG
+    divisor assumes int8-magnitude weights and would crush unit-magnitude
+    ternary activations ~16× per layer. Pass ``act_dtype=jnp.int32`` for logits.
+
+    Surgery replaces this with :class:`ZgTernaryIntLinear`.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bias: bool = True,
+        act_dtype: jnp.dtype | None = None,
+        rngs: nnx.Rngs,
+    ) -> None:
+        self.in_features = int(in_features)
+        w_t, _gamma = ternary_init(rngs.params(), (in_features, out_features))
+        self.kernel = mark_ternary(nnx.Param(w_t))
+        self.bias = (
+            nnx.Param(jnp.zeros((out_features,), dtype=jnp.int32)) if use_bias else None
+        )
+        self.use_bias = use_bias
+        self.act_dtype = jnp.int8 if act_dtype is None else act_dtype
+
+    def __call__(self, x: Array) -> Array:
+        y = int_matmul(x, self.kernel[...])
+        if self.use_bias and self.bias is not None:
+            y = y + self.bias[...]
+        return ternary_requantize(y, self.in_features, act_dtype=self.act_dtype)
+
+
 class IntLUT(nnx.Module):
     """Element-wise int8→int8 nonlinearity via a learnable 256-entry LUT.
 
@@ -660,6 +772,97 @@ class IntLinearLUT(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         return self.lut(self.linear(x))
+
+
+class ZgTernaryIntLinear(nnx.Module):
+    """``TernaryIntLinear`` with factor-only integer ternary perturbations.
+
+    Identical perturbation algebra to :class:`ZgIntLinear`; only the requantize
+    divisor differs (``√K`` via :func:`ternary_requantize`).
+    """
+
+    def __init__(
+        self,
+        linear: TernaryIntLinear,
+        slot: ZeroGradSlot,
+        kernel_group: str,
+        bias_group: str | None,
+    ) -> None:
+        self.kernel = linear.kernel
+        self.bias = linear.bias
+        self.use_bias = linear.use_bias
+        self.act_dtype = linear.act_dtype
+        self.in_features = linear.in_features
+        self.slot = slot
+        self.kernel_group = kernel_group
+        self.bias_group = bias_group
+        self.layer_index = _stacked_layer_index(linear.kernel[...], 2)
+
+    def __call__(self, x: Array) -> Array:
+        slot = self.slot
+        kernel = self.kernel[...]
+        if slot.enabled:
+            y = perturbed_int_linear(
+                x,
+                kernel,
+                _factor_key(slot, self.kernel_group, self.layer_index),
+                slot.rank,
+                slot.sigma_shift,
+                factor_sign=slot.factor_sign[...],
+            )
+        else:
+            y = int_matmul(x, kernel)
+        if self.use_bias and self.bias is not None:
+            bias = _maybe_perturb_vector(
+                self.bias[...],
+                slot,
+                self.bias_group,
+                layer_index=self.layer_index,
+            )
+            y = y + bias.astype(jnp.int32)
+        return ternary_requantize(y, self.in_features, act_dtype=self.act_dtype)
+
+
+class TernaryLinearLUT(nnx.Module):
+    """Pure-integer ternary block: ``int8 @ {-1,0,+1}`` → ``int32`` → ``int8`` LUT.
+
+    Composes :class:`TernaryIntLinear` (ternary kernel, ``√K`` requantize) with
+    a learnable :class:`IntLUT` nonlinearity. ``__call__`` runs the unfused
+    integer path, which stays correct under candidate perturbation for ES
+    training. Use :func:`zerograd.packed_ternary_lut_fused` for the fused
+    packed-uint8 GPU eval path (bit-identical when candidates are disabled).
+
+    Surgery walks into ``linear`` / ``lut`` and wraps them as
+    :class:`ZgTernaryIntLinear` / :class:`ZgIntLUT` — no dedicated wrapper.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        use_bias: bool = False,
+        lut_init: str = "identity",
+        explore_shift: int = 0,
+        rngs: nnx.Rngs,
+    ) -> None:
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.linear = TernaryIntLinear(
+            in_features,
+            out_features,
+            use_bias=use_bias,
+            act_dtype=jnp.int8,
+            rngs=rngs,
+        )
+        self.lut = IntLUT(init=lut_init, explore_shift=explore_shift, rngs=rngs)
+
+    def __call__(self, x: Array) -> Array:
+        return self.lut(self.linear(x))
+
+    def packed_kernel(self) -> Array:
+        """Pack the (unperturbed) ternary kernel to uint8 ``(K//4, N)``."""
+        return pack_ternary(self.linear.kernel[...])
 
 
 class ZgIntLUT(nnx.Module):
@@ -1050,6 +1253,7 @@ def _is_surged(module: object) -> bool:
             ZgIntLinear,
             ZgIntLUT,
             ZgIntEmbedding,
+            ZgTernaryIntLinear,
             ZgTernaryLinear,
             ZgEmbed,
             ZgLayerNorm,
@@ -1073,12 +1277,10 @@ def _replace_matrix_layer(
 ) -> None:
     """Append kernel/bias manifest entries and replace ``value`` with a Zg wrapper."""
     leaf = _path_tuple(child_path)
-    kg = _path_str(child_path + ("kernel",))
-    entries.append(ManifestEntry(leaf + ("kernel",), layout_fn(value.kernel), kg))
+    kg = _append_entry(entries, leaf, "kernel", layout_fn(value.kernel), child_path)
     bg: str | None = None
     if value.use_bias and value.bias is not None:
-        bg = _path_str(child_path + ("bias",))
-        entries.append(ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg))
+        bg = _append_entry(entries, leaf, "bias", ParameterLayout.VECTOR, child_path)
     setattr(module, name, zg_cls(value, slot, kg, bg))
 
 
@@ -1094,8 +1296,7 @@ def _replace_embed_layer(
 ) -> None:
     """Append embedding TABLE entry and replace ``value`` with a Zg embed wrapper."""
     leaf = _path_tuple(child_path)
-    g = _path_str(child_path + ("embedding",))
-    entries.append(ManifestEntry(leaf + ("embedding",), ParameterLayout.TABLE, g))
+    g = _append_entry(entries, leaf, "embedding", ParameterLayout.TABLE, child_path)
     setattr(module, name, zg_cls(value, slot, g))
 
 
@@ -1116,8 +1317,9 @@ def apply_surgery(
     if not isinstance(model, nnx.Module):
         raise TypeError("apply_surgery expects an nnx.Module")
 
-    if hasattr(model, "zg_slot") and isinstance(getattr(model, "zg_slot", None), ZeroGradSlot):
-        slot: ZeroGradSlot = getattr(model, "zg_slot")
+    existing = optional_model_zg_slot(model)
+    if existing is not None:
+        slot = existing
         slot.rank = rank
         slot.sigma = sigma
         slot.sigma_shift = int(sigma_shift)
@@ -1126,7 +1328,7 @@ def apply_surgery(
         slot = ZeroGradSlot(
             rank=rank, sigma=sigma, sigma_shift=sigma_shift, integer_es=integer_es
         )
-        setattr(model, "zg_slot", slot)
+        set_model_zg_slot(model, slot)
 
     entries: list[ManifestEntry] = []
 
@@ -1134,6 +1336,7 @@ def apply_surgery(
     _matrix_surgery = (
         (nnx.Linear, ZgLinear, lambda _: ParameterLayout.MATRIX),
         (nnx.Conv, ZgConv, lambda _: ParameterLayout.MATRIX),
+        (TernaryIntLinear, ZgTernaryIntLinear, _matrix_layout),
         (IntLinear, ZgIntLinear, _matrix_layout),
         (IntConv, ZgIntConv, _matrix_layout),
     )
@@ -1141,7 +1344,7 @@ def apply_surgery(
         if not isinstance(module, nnx.Module) or _is_surged(module):
             continue
         for name, value in list(vars(module).items()):
-            child_path = path + (name,)
+            child_path = (*path, name)
             replaced = False
             for base_cls, zg_cls, layout_fn in _matrix_surgery:
                 if isinstance(value, base_cls):
@@ -1161,32 +1364,27 @@ def apply_surgery(
                 continue
             if isinstance(value, IntLUT):
                 leaf = _path_tuple(child_path)
-                g = _path_str(child_path + ("table",))
-                entries.append(
-                    ManifestEntry(leaf + ("table",), _vector_layout(value.table), g)
+                g = _append_entry(
+                    entries, leaf, "table", _vector_layout(value.table), child_path
                 )
                 setattr(module, name, ZgIntLUT(value, slot, g))
             elif isinstance(value, TernaryLinear):
                 leaf = _path_tuple(child_path)
-                kg = _path_str(child_path + ("kernel",))
-                gg = _path_str(child_path + ("gamma",))
-                entries.append(
-                    ManifestEntry(leaf + ("kernel",), ParameterLayout.MATRIX, kg)
+                kg = _append_entry(
+                    entries, leaf, "kernel", ParameterLayout.MATRIX, child_path
                 )
-                entries.append(
-                    ManifestEntry(leaf + ("gamma",), ParameterLayout.VECTOR, gg)
+                gg = _append_entry(
+                    entries, leaf, "gamma", ParameterLayout.VECTOR, child_path
                 )
                 rg: str | None = None
                 if value.use_rms_norm and value.rms_scale is not None:
-                    rg = _path_str(child_path + ("rms_scale",))
-                    entries.append(
-                        ManifestEntry(leaf + ("rms_scale",), ParameterLayout.VECTOR, rg)
+                    rg = _append_entry(
+                        entries, leaf, "rms_scale", ParameterLayout.VECTOR, child_path
                     )
                 bg = None
                 if value.use_bias and value.bias is not None:
-                    bg = _path_str(child_path + ("bias",))
-                    entries.append(
-                        ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
+                    bg = _append_entry(
+                        entries, leaf, "bias", ParameterLayout.VECTOR, child_path
                     )
                 setattr(module, name, ZgTernaryLinear(value, slot, kg, gg, rg, bg))
             elif isinstance(value, IntEmbedding):
@@ -1202,14 +1400,12 @@ def apply_surgery(
                 sg: str | None = None
                 bg = None
                 if value.use_scale and value.scale is not None:
-                    sg = _path_str(child_path + ("scale",))
-                    entries.append(
-                        ManifestEntry(leaf + ("scale",), ParameterLayout.VECTOR, sg)
+                    sg = _append_entry(
+                        entries, leaf, "scale", ParameterLayout.VECTOR, child_path
                     )
                 if value.use_bias and value.bias is not None:
-                    bg = _path_str(child_path + ("bias",))
-                    entries.append(
-                        ManifestEntry(leaf + ("bias",), ParameterLayout.VECTOR, bg)
+                    bg = _append_entry(
+                        entries, leaf, "bias", ParameterLayout.VECTOR, child_path
                     )
                 setattr(module, name, ZgLayerNorm(value, slot, sg, bg))
 
@@ -1220,21 +1416,18 @@ def apply_surgery(
         for name, value in list(vars(module).items()):
             if not isinstance(value, nnx.Param):
                 continue
-            child_path = path + (name,)
+            child_path = (*path, name)
             # After wrapping, param lives at child_path + ("param",)
             layout = _layout_from_param(value)
             leaf = _path_tuple(child_path)
             if layout is ParameterLayout.VECTOR:
-                g = _path_str(child_path + ("param",))
-                entry_layout = _vector_layout(value)
-                entries.append(
-                    ManifestEntry(leaf + ("param",), entry_layout, g)
+                g = _append_entry(
+                    entries, leaf, "param", _vector_layout(value), child_path
                 )
                 setattr(module, name, ZgVector(value, slot, g))
             elif layout is ParameterLayout.TABLE:
-                g = _path_str(child_path + ("param",))
-                entries.append(
-                    ManifestEntry(leaf + ("param",), ParameterLayout.TABLE, g)
+                g = _append_entry(
+                    entries, leaf, "param", ParameterLayout.TABLE, child_path
                 )
                 setattr(module, name, ZgTable(value, slot, g))
             elif layout is ParameterLayout.MATRIX:
@@ -1327,14 +1520,14 @@ def bind_candidate(
         flat_state.append((path, variable))
     bound_state = nnx.from_flat_state(flat_state)
     model = nnx.merge(graphdef, bound_state)
-    slot = getattr(model, "zg_slot", None)
-    if isinstance(slot, ZeroGradSlot):
+    slot = optional_model_zg_slot(model)
+    if slot is not None:
         slot.enabled = enabled
     return model
 
 
 def disable_candidates(model: nnx.Module) -> None:
     """Turn off candidate perturbations (eval / inference)."""
-    slot = getattr(model, "zg_slot", None)
-    if isinstance(slot, ZeroGradSlot):
+    slot = optional_model_zg_slot(model)
+    if slot is not None:
         slot.enabled = False

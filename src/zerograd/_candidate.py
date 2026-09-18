@@ -348,10 +348,12 @@ def perturbed_int_table_lookup(
     *,
     factor_sign: Array | int = 1,
 ) -> Array:
-    """Appendix H.1 table gather: ``table[i] + ((A[i] @ B) >> (4+σ̂))`` in int.
+    """Integer table gather; thin wrapper around :func:`perturbed_table_lookup`.
 
-    Draws bulk ``A[V,r]`` (small at Qwen scale) then gathers rows — same factors
-    as :func:`zerograd._replay.replay_entry_integer` for ES correctness.
+    Requires ``sigma_shift`` (Appendix H.1) instead of float ``sigma``. Row factors
+    are drawn via :func:`~zerograd._factors.table_factors` inside
+    :func:`perturbed_table_lookup`, then gathered at ``indices`` — same algebra as
+    :func:`~zerograd._replay.replay_entry_integer` for ES replay parity.
     """
     return perturbed_table_lookup(
         table,

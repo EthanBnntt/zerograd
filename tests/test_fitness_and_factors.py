@@ -129,6 +129,40 @@ class TestTableFactors:
         with pytest.raises(ValueError):
             table_factors(jax_key(0), (16,), rank=2, dtype=jnp.float32)
 
+    def test_rejects_nonpositive_dimension(self):
+        with pytest.raises(ValueError):
+            table_factors(jax_key(0), (16, 0), rank=2, dtype=jnp.float32)
+
+    def test_rejects_nonpositive_rank(self):
+        with pytest.raises(ValueError):
+            table_factors(jax_key(0), (16, 4), rank=0, dtype=jnp.float32)
+
+    def test_rejects_bool_rank(self):
+        with pytest.raises(ValueError):
+            table_factors(jax_key(0), (16, 4), rank=True, dtype=jnp.float32)
+
+    def test_deterministic_for_same_key(self):
+        a1, b1 = table_factors(jax_key(7), (16, 4), rank=3, dtype=jnp.float32)
+        a2, b2 = table_factors(jax_key(7), (16, 4), rank=3, dtype=jnp.float32)
+        np.testing.assert_array_equal(np.asarray(a1), np.asarray(a2))
+        np.testing.assert_array_equal(np.asarray(b1), np.asarray(b2))
+
+
+class TestFactorDtype:
+    def test_matrix_factors_dtype(self):
+        a, b = matrix_factors(jax_key(0), (8, 4), rank=2, dtype=jnp.float32)
+        assert a.dtype == jnp.float32
+        assert b.dtype == jnp.float32
+
+    def test_matrix_factors_bf16_dtype(self):
+        a, b = matrix_factors(jax_key(0), (8, 4), rank=2, dtype=jnp.bfloat16)
+        assert a.dtype == jnp.bfloat16
+        assert b.dtype == jnp.bfloat16
+
+    def test_vector_noise_dtype(self):
+        n = vector_noise(jax_key(0), (8,), dtype=jnp.float32)
+        assert n.dtype == jnp.float32
+
 
 class TestVectorNoise:
     def test_shape_matches_vector_layout(self):

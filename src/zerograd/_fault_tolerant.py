@@ -219,7 +219,7 @@ class FaultTolerantCluster:
 
         weights = [s.weight for s in active]
         sizes = compute_partition_sizes(self._pop, weights)
-        for status, ids in zip(active, split_candidate_ids(self._pop, sizes)):
+        for status, ids in zip(active, split_candidate_ids(self._pop, sizes), strict=True):
             status._shard_ids = ids
 
     def _get_active_shards(self) -> list[tuple[NodeStatus, Array]]:

@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TypeAlias
 
 import jax
 
-
-ParameterPath: TypeAlias = tuple[str, ...]
-ParameterTree: TypeAlias = Mapping[str, "ParameterTree | jax.Array"]
+type ParameterPath = tuple[str, ...]
+type ParameterTree = Mapping[str, "ParameterTree | jax.Array"]
+type ThresholdTree = Mapping[str, "ThresholdTree | jax.Array | int"]
 
 
 class ParameterLayout(StrEnum):

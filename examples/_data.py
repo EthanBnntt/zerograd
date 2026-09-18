@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import gzip
 import os
-import socket
 import struct
 import tarfile
 import time
@@ -43,7 +42,7 @@ def _download(url: str, dest: str, description: str, *, retries: int = 3, timeou
     for attempt in range(1, retries + 1):
         try:
             return _download_once(url, dest, description, timeout)
-        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as exc:
+        except (TimeoutError, urllib.error.URLError, ConnectionError, OSError) as exc:
             last_err = exc
             if os.path.exists(dest):
                 os.remove(dest)
@@ -112,7 +111,7 @@ def load_cifar10() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not os.path.exists(extracted):
         os.makedirs(CACHE_DIR, exist_ok=True)
         if not os.path.exists(archive):
-            print(f"Downloading CIFAR-10 (~168 MB) from S3 mirror ...")
+            print("Downloading CIFAR-10 (~168 MB) from S3 mirror ...")
             _download(CIFAR_URL, archive, "CIFAR-10")
         print("Extracting CIFAR-10 ...")
         with tarfile.open(archive, "r:gz") as tar:

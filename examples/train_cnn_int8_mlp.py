@@ -25,14 +25,17 @@ import time
 import jax
 import jax.numpy as jnp
 import optax
+from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
+from _data import load_cifar10
+from _integer_es_cli import (
+    add_update_alpha_arg,
+    require_even_population,
+    resolve_candidate_chunk,
+)
 from flax import nnx
 
 from zerograd import IntConv, IntLinear, IntLUT, ZeroGrad, int_avg_pool2d
 from zerograd._nnx import disable_candidates, params_pure_dict, update_params
-
-from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
-from _data import load_cifar10
-from _integer_es_cli import add_update_alpha_arg, require_even_population, resolve_candidate_chunk
 
 DEFAULT_STEPS = 200
 DEFAULT_BATCH = 128

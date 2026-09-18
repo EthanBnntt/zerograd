@@ -42,7 +42,8 @@ network cost. Compare to backprop's O(parameters) gradient sync.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence, cast
+from collections.abc import Callable, Sequence
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -152,7 +153,7 @@ def _trees_close(a: Any, b: Any, atol: float = 1e-5) -> bool:
     leaves_b = _module_or_tree_leaves(b)
     if len(leaves_a) != len(leaves_b):
         return False
-    for x, y in zip(leaves_a, leaves_b):
+    for x, y in zip(leaves_a, leaves_b, strict=True):
         if x.shape != y.shape or float(jnp.max(jnp.abs(x - y))) > atol:
             return False
     return True
@@ -286,7 +287,7 @@ class ClusterZeroGrad:
         3. Each node independently calls step_from_losses.
         4. All nodes arrive at identical params.
         """
-        shards = list(zip(self._nodes, self._shard_ids))
+        shards = list(zip(self._nodes, self._shard_ids, strict=True))
         return evaluate_and_step(shards, self._nodes, batch)
 
     def verify_sync(self, atol: float = 1e-5) -> bool:

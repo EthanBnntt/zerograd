@@ -1,27 +1,26 @@
 """Shared training loop for the MNIST / CIFAR-10 2-layer MLP examples.
 
-``train_mnist.py`` and `train_cifar10.py`` are thin wrappers around
+``train_vision_mlp.py`` are thin wrappers around
 :func:`run` that only differ in dataset, dimensions, and a couple of
 hyperparameters. Keeping one parameterized training loop here means fixes
-(checkpointing, early stopping, logging) land in both scripts at once.
+(checkpointing, early stopping, logging) land in every dataset at once.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import jax
 import jax.numpy as jnp
 import optax
+from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
 from flax import nnx
 
 from zerograd import ZeroGrad
 from zerograd._nnx import params_pure_dict, update_params
-
-from _checkpoint import EarlyStopping, load_checkpoint, save_checkpoint
 
 
 @dataclass(frozen=True)

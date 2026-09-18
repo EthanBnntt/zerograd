@@ -3,16 +3,19 @@
 import jax
 import jax.numpy as jnp
 import optax
+import pytest
+from _tiny import batch as _batch
+from _tiny import build_model as _build_model
+from _tiny import make_opt
+from _tiny import mse_loss as _loss_fn
+
+# ── Shared fixtures ───────────────────────────────────────────────────────────
+from flax import nnx
 
 from zerograd import (
     FaultTolerantCluster,
     ZeroGrad,
 )
-
-
-# ── Shared fixtures ───────────────────────────────────────────────────────────
-
-from flax import nnx
 from zerograd._nnx import params_pure_dict
 
 
@@ -130,7 +133,7 @@ class TestFaultTolerantCluster:
         late_params = fc.nodes[idx].params
         for a, b in zip(
             jax.tree_util.tree_leaves(params_pure_dict(params)),
-            jax.tree_util.tree_leaves(params_pure_dict(late_params)),
+            jax.tree_util.tree_leaves(params_pure_dict(late_params)), strict=False,
         ):
             assert float(jnp.max(jnp.abs(a - b))) < 1e-5
 
@@ -309,3 +312,146 @@ class TestFaultTolerantCluster:
         for _ in range(5):
             params, state, _ = opt2.step(state, params, batch, loss_fn)
         assert fc.verify_against_single(params, atol=1e-5)
+
+
+def _make_opt(pop=16, **kw):
+    return make_opt(pop=pop, run_id="ft-test", **kw)
+
+
+class TestFaultTolerantProperties:
+    def test_generation_and_history_track_steps(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2)
+        assert fc.generation == 0
+        assert fc.loss_history_size == 0
+        fc.step(_batch())
+        assert fc.generation == 1
+        assert fc.loss_history_size == 1
+
+    def test_generation_counts_steps_after_history_truncation(self):
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_model, _loss_fn, seed=42,
+            initial_nodes=2, max_loss_history=3,
+        )
+        for _ in range(8):
+            fc.step(_batch())
+        assert fc.generation == 8
+        assert fc.loss_history_size == 3
+        assert fc.generation == fc.nodes[0].generation
+
+    def test_init_returns_node_zero_state(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2)
+        state = fc.init()
+        assert state.generation == 0
+        assert state is fc.nodes[0].state
+
+    def test_active_nodes_excludes_paused(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=3)
+        assert len(fc.active_nodes) == 3
+        fc.pause_node(0)
+        assert len(fc.active_nodes) == 2
+        assert fc.nodes[0] not in fc.active_nodes
+
+    def test_communication_accounting(self):
+        pop = 16
+        fc = FaultTolerantCluster(
+            _make_opt(pop=pop), _build_model, _loss_fn, seed=42, initial_nodes=2,
+        )
+        assert fc.losses_bytes_per_step == pop * 4
+        param_count = sum(
+            v.size for v in jax.tree_util.tree_leaves(params_pure_dict(fc.nodes[0].params))
+        )
+        assert fc.params_bytes == param_count * 4
+
+    def test_params_bytes_zero_when_no_nodes(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=1)
+        fc.remove_node(0)
+        assert fc.params_bytes == 0
+
+
+class TestResumeKeepsNodeSynced:
+    def test_resume_after_pause_stays_synced(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=3)
+        for _ in range(4):
+            fc.step(_batch())
+        fc.pause_node(1)
+        for _ in range(3):
+            fc.step(_batch())
+        fc.resume_node(1)
+        assert fc.get_status(1).last_generation == fc.generation
+        assert fc.verify_sync()
+
+    def test_resume_marks_node_active(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2)
+        fc.pause_node(0)
+        assert not fc.get_status(0).active
+        fc.resume_node(0)
+        assert fc.get_status(0).active
+        assert not fc.get_status(0).paused
+
+
+class TestVerificationDrift:
+    def test_verify_sync_detects_drift(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2)
+        fc.step(_batch())
+        fc.nodes[1]._params = {"w": jnp.ones((4, 2)), "v": jnp.zeros((2,))}
+        assert not fc.verify_sync()
+
+    def test_verify_against_single_detects_mismatch(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=1)
+        fc.step(_batch())
+        baseline = _build_model(jax.random.key(999))
+        assert not fc.verify_against_single(baseline)
+
+    def test_verify_sync_trivially_true_with_one_node(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=1)
+        fc.step(_batch())
+        assert fc.verify_sync()
+
+
+class TestEmptyRegistryGuards:
+    def test_rejects_initial_nodes_zero(self):
+        with pytest.raises(ValueError):
+            FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=0)
+
+    def test_step_raises_when_all_nodes_paused(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2)
+        fc.pause_node(0)
+        fc.pause_node(1)
+        with pytest.raises(RuntimeError):
+            fc.step(_batch())
+
+    def test_step_raises_when_registry_empty(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2)
+        fc.remove_node(1)
+        fc.remove_node(0)
+        with pytest.raises(RuntimeError):
+            fc.step(_batch())
+
+    def test_init_raises_when_registry_empty(self):
+        fc = FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=1)
+        fc.remove_node(0)
+        with pytest.raises(RuntimeError):
+            fc.init()
+
+
+class TestLateJoinCatchUp:
+    def test_refuses_when_history_truncated(self):
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_model, _loss_fn, seed=42,
+            initial_nodes=2, max_loss_history=3,
+        )
+        for _ in range(8):
+            fc.step(_batch())
+        with pytest.raises(RuntimeError):
+            fc.add_node(name="late")
+
+    def test_last_generation_matches_cluster_generation(self):
+        fc = FaultTolerantCluster(
+            _make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=2,
+        )
+        for _ in range(8):
+            fc.step(_batch())
+        idx = fc.add_node(name="late")
+        assert fc.get_status(idx).last_generation == 8
+        assert fc.get_status(idx).last_generation == fc.nodes[idx].generation
+        assert fc.verify_sync()

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
 import inspect
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -13,23 +13,28 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from ._eggroll_h import (
-    antithetical_pair_id,
-    antithetical_sign,
+from ._bin_updates import (
     apply_bin_updates,
-    shape_antithetical_loss,
     threshold_tree_for_manifest,
     update_alpha_schedule,
 )
-from ._fitness import shape_centered_loss, validate_losses
+from ._fitness import (
+    antithetical_pair_id,
+    antithetical_sign,
+    shape_antithetical_loss,
+    shape_centered_loss,
+    validate_losses,
+)
 from ._integer import float_view_tree, qrange, snap_tree_to_integer
 from ._keys import candidate_key, step_key
 from ._manifest import Manifest, ParameterTree
 from ._nnx import (
-    ZeroGradSlot,
     apply_surgery,
     bind_candidate,
+    collect_int_bits_by_path,
     disable_candidates,
+    model_zg_slot,
+    optional_model_zg_slot,
     params_pure_dict,
     update_params,
 )
@@ -207,6 +212,9 @@ class ZeroGrad:
         self._int_bin_updates = bool(integer_es) and (
             self._ternary_bins or (bool(int_bin_updates) and not self._bin_updates)
         )
+        # Per-leaf integer bit-widths from mark_ternary / INT_BITS metadata
+        # (populated at init). Empty → every int leaf uses ``self._int_bits``.
+        self._int_bits_by_path: dict[tuple[str, ...], int] = {}
 
     def init(self, model_or_params: nnx.Module | ParameterTree) -> ZeroGradState:
         """Initialize optimizer state.
@@ -217,9 +225,7 @@ class ZeroGrad:
         """
         if isinstance(model_or_params, nnx.Module):
             model = model_or_params
-            already = hasattr(model, "zg_slot") and isinstance(
-                getattr(model, "zg_slot", None), ZeroGradSlot
-            )
+            already = optional_model_zg_slot(model) is not None
             if not already:
                 model, auto_manifest = apply_surgery(
                     model,
@@ -232,8 +238,7 @@ class ZeroGrad:
                 # group strings stay consistent with Manifest.entries.
                 self._manifest = auto_manifest
             else:
-                slot = getattr(model, "zg_slot")
-                assert isinstance(slot, ZeroGradSlot)
+                slot = model_zg_slot(model)
                 if self._manifest is None:
                     if slot.manifest is None:
                         raise ValueError(
@@ -243,8 +248,7 @@ class ZeroGrad:
                     self._manifest = slot.manifest
                 else:
                     slot.manifest = self._manifest
-            slot = getattr(model, "zg_slot")
-            assert isinstance(slot, ZeroGradSlot)
+            slot = model_zg_slot(model)
             slot.rank = self._rank
             slot.sigma = self._sigma
             slot.sigma_shift = self._sigma_shift
@@ -252,6 +256,16 @@ class ZeroGrad:
             assert self._manifest is not None
             params = params_pure_dict(model)
             self._manifest.validate(params)
+            self._int_bits_by_path = collect_int_bits_by_path(model)
+            # Mixed int8 + ternary model under a non-identity transform: enable
+            # the int-bin path so ternary leaves snap to {-1,0,1} (per-leaf
+            # ranges) while any float leaves go through the Optax transform.
+            if (
+                self._integer_es
+                and not self._bin_updates
+                and any(bits == 2 for bits in self._int_bits_by_path.values())
+            ):
+                self._int_bin_updates = True
             if self._bin_updates:
                 opt_state = None
             else:
@@ -429,11 +443,39 @@ class ZeroGrad:
             base_key,
         )
 
-    def _jit_update_bin_params(self, params: ParameterTree, thresholds: ParameterTree):
+    def _qbound_trees(self, params: ParameterTree):
+        """Per-leaf ``(qmin, qmax)`` for bin updates, honoring marked ternary leaves.
+
+        Returns scalars when no leaf carries ``zerograd_int_bits`` metadata
+        (the common single-range case); otherwise returns qmin/qmax pytrees
+        aligned with ``params`` so int8 leaves snap to ``[-128,127]`` while
+        ternary-marked leaves snap to ``{-1,0,1}``.
+        """
+        by_path = self._int_bits_by_path
+        default_bits = self._int_bits
+        if not by_path:
+            return qrange(default_bits)
+
+        def build(node: Any, path: tuple[str, ...]) -> Any:
+            # Returns a (qmin_subtree, qmax_subtree) pair to avoid treating the
+            # (lo, hi) tuple as a pytree node (jax.tree.map would split it).
+            if isinstance(node, dict):
+                qmin_d: dict = {}
+                qmax_d: dict = {}
+                for k, v in node.items():
+                    lo_sub, hi_sub = build(v, (*path, str(k)))
+                    qmin_d[k] = lo_sub
+                    qmax_d[k] = hi_sub
+                return qmin_d, qmax_d
+            return qrange(by_path.get(tuple(path), default_bits))
+
+        return build(params, ())
+
+    def _jit_update_bin_params(self, params: ParameterTree):
         """JIT the bin-update path once per params shape (cached on the instance).
 
-        Thresholds are folded as static Python ints (not traced) so the jitted
-        function only takes array arguments.
+        Thresholds are traced arguments (not closed over) so ``update_alpha`` /
+        ``alpha_decay`` changes take effect every generation.
         """
         if not hasattr(self, "_bin_update_jit_cache"):
             self._bin_update_jit_cache: dict = {}
@@ -441,13 +483,13 @@ class ZeroGrad:
         sig = _tree_sig(params)
         jit_fn = self._bin_update_jit_cache.get(sig)
         if jit_fn is None:
-            qmin, qmax = qrange(self._int_bits)
+            qmin, qmax = self._qbound_trees(params)
 
-            def _update(params_p, evidence_p):
+            def _update(params_p, evidence_p, thresholds_p):
                 return apply_bin_updates(
                     params_p,
                     evidence_p,
-                    thresholds,
+                    thresholds_p,
                     qmin=qmin,
                     qmax=qmax,
                 )
@@ -475,7 +517,7 @@ class ZeroGrad:
             rank = self._rank
             half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
-            qmin, qmax = qrange(self._int_bits)
+            qmin, qmax = self._qbound_trees(params)
 
             def replay_and_update(params_p, losses_p, base_key_p, thresholds_p):
                 shaped_p = shape_antithetical_loss(losses_p)
@@ -533,6 +575,58 @@ class ZeroGrad:
                 f"losses must have {self._population_size} entries, got {losses.shape[0]}"
             )
 
+    def _jit_float_step(self, params: ParameterTree):
+        """Compile loss-shaping + factor replay + pseudo-grad + Optax update as
+        one device program (float ES path).
+
+        Same rationale as :meth:`_jit_integer_bin_step`: the eager path
+        dispatched one program per manifest leaf for replay and ran the Optax
+        transform piecemeal, so Python dispatch dominated generation loops on
+        small models.
+        """
+        if not hasattr(self, "_float_step_jit_cache"):
+            self._float_step_jit_cache: dict = {}
+        sig = _tree_sig(params)
+        jit_fn = self._float_step_jit_cache.get(sig)
+        if jit_fn is None:
+            assert self._manifest is not None
+            manifest = self._manifest
+            rank = self._rank
+            sigma = self._sigma
+            pop = self._population_size
+            candidate_ids = jnp.arange(pop, dtype=jnp.int32)
+            even = pop % 2 == 0
+
+            def replay_and_update(params_p, losses_p, base_key_p, opt_state_p):
+                shaped = shape_centered_loss(losses_p, sigma)
+                descent = replay(
+                    params_p, manifest, base_key_p, candidate_ids, shaped, rank
+                )
+                pseudo_grad = _build_pseudo_grad(descent, params_p)
+                float_params = float_view_tree(params_p)
+                updates, new_opt_state = self._transform.update(
+                    pseudo_grad, opt_state_p, float_params
+                )
+                new_float = cast(Any, optax.apply_updates(float_params, updates))
+                new_params = snap_tree_to_integer(new_float, params_p)
+                if even:
+                    half = pop // 2
+                    margin = jnp.mean(jnp.abs(losses_p[:half] - losses_p[half:]))
+                else:
+                    margin = jnp.asarray(jnp.nan, dtype=losses_p.dtype)
+                metrics = (
+                    jnp.mean(losses_p),
+                    jnp.min(losses_p),
+                    jnp.max(losses_p),
+                    jnp.std(losses_p),
+                    margin,
+                )
+                return new_params, new_opt_state, metrics
+
+            jit_fn = jax.jit(replay_and_update)
+            self._float_step_jit_cache[sig] = jit_fn
+        return jit_fn
+
     def _optax_from_descent(
         self,
         params: ParameterTree,
@@ -573,9 +667,9 @@ class ZeroGrad:
         assert self._manifest is not None
         generation = state.generation
         base_key = step_key(self._seed, self._run_id, generation, self._manifest.version)
+        half = self._population_size // 2
 
         if self._bin_updates or self._int_bin_updates:
-            half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
             alpha = update_alpha_schedule(
                 generation, base=self._update_alpha, decay=self._alpha_decay
@@ -587,6 +681,7 @@ class ZeroGrad:
                 self._manifest,
                 alpha=alpha_clip,
                 num_directions=half,
+                rank=self._rank,
             )
             if self._bin_updates:
                 # Pure integer path: compile replay and update together so the
@@ -600,8 +695,8 @@ class ZeroGrad:
                     params, self._manifest, base_key, pair_ids, shaped, self._rank
                 )
                 # Mixed path also needs float-leaf evidence below.
-                update_fn = self._jit_update_bin_params(params, thresholds)
-                new_params = update_fn(params, evidence)
+                update_fn = self._jit_update_bin_params(params)
+                new_params = update_fn(params, evidence, thresholds)
                 # Mixed int bins + AdamW: bin-flip integer leaves, Adam float leaves.
                 shaped_f = shape_centered_loss(losses, self._sigma)
                 pair_weights = shaped_f[:half] - shaped_f[half:]
@@ -616,7 +711,6 @@ class ZeroGrad:
                     mask_integers_against=new_params,
                 )
         elif self._integer_es:
-            half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
             shaped = shape_centered_loss(losses, self._sigma)
             pair_weights = shaped[:half] - shaped[half:]
@@ -627,16 +721,19 @@ class ZeroGrad:
                 params, descent, state.opt_state, bits=self._int_bits
             )
         else:
-            candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
-            shaped = shape_centered_loss(losses, self._sigma)
-            descent = replay(params, self._manifest, base_key, candidate_ids, shaped, self._rank)
-            new_params, new_opt_state = self._optax_from_descent(
-                params, descent, state.opt_state, bits=None
+            update_fn = self._jit_float_step(params)
+            new_params, new_opt_state, m = update_fn(params, losses, base_key, state.opt_state)
+            new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
+            metrics = StepMetrics(
+                generation=generation,
+                mean_loss=m[0], min_loss=m[1], max_loss=m[2], std_loss=m[3],
+                mean_pair_margin=m[4],
+                population_size=self._population_size,
             )
+            return new_params, new_state, metrics
 
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
         if self._population_size % 2 == 0:
-            half = self._population_size // 2
             pair_margin = jnp.mean(jnp.abs(losses[:half] - losses[half:]))
         else:
             pair_margin = jnp.asarray(jnp.nan, dtype=losses.dtype)
@@ -816,7 +913,7 @@ def _apply_negation(
 ) -> None:
     """Walk the parameter tree, negating manifest entries and zeroing others."""
     for key, value in params.items():
-        current_path = path + (key,)
+        current_path = (*path, key)
         if isinstance(value, Mapping):
             sub_out: dict = {}
             _apply_negation(value, current_path, descent, sub_out)

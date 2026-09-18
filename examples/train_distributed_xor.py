@@ -14,12 +14,9 @@ This demonstrates the core distributed property of ES optimization:
 candidates are embarrassingly parallel, and workers need to share only
 fitness values — not parameters, gradients, or activations.
 
-    uv run python examples/train_distributed_xor.py --devices cpu,gpu
-    uv run python examples/train_distributed_xor.py --devices gpu,gpu
+    uv run python examples/train_distributed_xor.py --layout cpu_gpu
+    uv run python examples/train_distributed_xor.py --layout dual_gpu
     uv run python examples/train_distributed_xor.py --devices cpu,gpu --weights 1,4
-
-See ``train_distributed_cpu_gpu.py`` and ``train_distributed_dual_worker.py``
-for the fixed-topology wrappers kept for backwards compatibility.
 """
 
 from __future__ import annotations
@@ -29,9 +26,9 @@ import time
 
 import jax
 import optax
+from _xor_model import XOR_X, XOR_Y, accuracy, build_model, loss_fn
 
 from zerograd import DistributedZeroGrad, ZeroGrad
-from _xor_model import XOR_X, XOR_Y, accuracy, build_model, loss_fn
 
 
 def _parse_device_spec(spec: str) -> jax.Device:
@@ -123,14 +120,33 @@ def run(
         print(f"Total time: {time.time() - t0:.1f}s")
 
 
-def build_arg_parser(*, default_devices: str, default_run_id: str) -> argparse.ArgumentParser:
+_LAYOUTS = {
+    "cpu_gpu": ("cpu,gpu", "xor-cpu-gpu"),
+    "dual_gpu": ("gpu,gpu", "xor-dual-gpu"),
+}
+
+
+def build_arg_parser(
+    *,
+    default_devices: str | None = None,
+    default_run_id: str = "xor-distributed",
+    default_layout: str | None = "cpu_gpu",
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Distributed ZeroGrad on XOR")
+    parser.add_argument(
+        "--layout",
+        choices=sorted(_LAYOUTS),
+        default=default_layout,
+        help="Preset worker topology (cpu_gpu | dual_gpu). "
+        "Ignored when --devices is set explicitly.",
+    )
     parser.add_argument(
         "--devices",
         type=str,
         default=default_devices,
         help="Comma-separated device specs, one per worker "
-        "(e.g. 'cpu,gpu' or 'gpu,gpu' or 'gpu:0,gpu:1').",
+        "(e.g. 'cpu,gpu' or 'gpu,gpu' or 'gpu:0,gpu:1'). "
+        "Overrides --layout when provided.",
     )
     parser.add_argument(
         "--weights",
@@ -148,11 +164,27 @@ def build_arg_parser(*, default_devices: str, default_run_id: str) -> argparse.A
     return parser
 
 
-def main(*, default_devices: str = "cpu,gpu", default_run_id: str = "xor-distributed") -> None:
-    parser = build_arg_parser(default_devices=default_devices, default_run_id=default_run_id)
+def main(
+    *,
+    default_devices: str | None = None,
+    default_run_id: str | None = None,
+    default_layout: str | None = "cpu_gpu",
+) -> None:
+    parser = build_arg_parser(
+        default_devices=default_devices,
+        default_run_id=default_run_id or "xor-distributed",
+        default_layout=default_layout,
+    )
     args = parser.parse_args()
 
-    device_specs = [spec for spec in args.devices.split(",") if spec.strip()]
+    layout = args.layout or "cpu_gpu"
+    layout_devices, layout_run_id = _LAYOUTS[layout]
+    devices_str = args.devices or layout_devices
+    run_id = args.run_id
+    if not args.devices and run_id == "xor-distributed":
+        run_id = layout_run_id
+
+    device_specs = [spec for spec in devices_str.split(",") if spec.strip()]
     devices = resolve_devices(device_specs)
     weights = (
         [float(w) for w in args.weights.split(",")] if args.weights else None
@@ -170,7 +202,7 @@ def main(*, default_devices: str = "cpu,gpu", default_run_id: str = "xor-distrib
         rank=args.rank,
         sigma=args.sigma,
         lr=args.lr,
-        run_id=args.run_id,
+        run_id=run_id,
     )
 
 

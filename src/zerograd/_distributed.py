@@ -19,10 +19,12 @@ floats per step, negligible overhead.
 
 from __future__ import annotations
 
+import contextlib
 import time
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence, TypeAlias, TypeVar
+from typing import Any, Self
 
 import jax
 import jax.numpy as jnp
@@ -33,20 +35,17 @@ from ._nnx import params_pure_dict, update_params
 from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
 Array = jax.Array
-Device: TypeAlias = Any  # jax.Device is nanobind; not usable in type expressions
-
-_T = TypeVar("_T")
-_R = TypeVar("_R")
+type Device = Any  # jax.Device is nanobind; not usable in type expressions
 
 
-def gather_shard_losses(
+def gather_shard_losses[T, R](
     executor: ThreadPoolExecutor,
-    shards: Sequence[_T],
-    evaluate_fn: Callable[[_T], _R],
+    shards: Sequence[T],
+    evaluate_fn: Callable[[T], R],
     *,
-    concat: Callable[[list[_R]], _R],
-    is_empty: Callable[[_T], bool] | None = None,
-) -> _R:
+    concat: Callable[[list[R]], R],
+    is_empty: Callable[[T], bool] | None = None,
+) -> R:
     """Submit ``evaluate_fn(shard)`` concurrently for each shard, then concatenate in order.
 
     Shards for which ``is_empty`` returns ``True`` are skipped entirely (no
@@ -255,24 +254,23 @@ class DistributedZeroGrad:
             executor.shutdown(wait=False)
             self._executor = None
 
-    def __enter__(self) -> DistributedZeroGrad:
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: object) -> bool:
+    def __exit__(self, *_exc: object) -> bool:
         self.shutdown()
         return False
 
     def __del__(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self.shutdown()
-        except Exception:
-            pass
 
     def _apply_partition(self) -> None:
         """Split candidate IDs according to current partition sizes and assign to shards."""
         for shard, ids in zip(
             self._shards,
             split_candidate_ids(self._optimizer.population_size, self._partition_sizes),
+            strict=True,
         ):
             shard._candidate_ids = ids
 
@@ -459,10 +457,10 @@ class ReplicatedDistributedZeroGrad:
             replica.candidate_ids = np.arange(offset, offset + size, dtype=np.int32)
             offset += size
 
-    def __enter__(self) -> "ReplicatedDistributedZeroGrad":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: object) -> bool:
+    def __exit__(self, *_exc: object) -> bool:
         self.shutdown()
         return False
 
@@ -597,9 +595,10 @@ class ReplicatedDistributedZeroGrad:
                 raise ValueError(
                     "restore_params currently supports stateless/bin-update optimizers"
                 )
-            with jax.default_device(replica.device):
+            device = replica.device
+            with jax.default_device(device):
                 params_device = jax.tree.map(
-                    lambda value: jax.device_put(value, replica.device),
+                    lambda value, dev=device: jax.device_put(value, dev),
                     params,
                 )
                 update_params(replica.model, params_device)

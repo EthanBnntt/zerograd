@@ -52,3 +52,34 @@ def validate_losses(losses: Array, *, check_finite: bool = True) -> None:
         )
     if check_finite and not jnp.all(jnp.isfinite(losses)):
         raise ValueError("candidate losses must be finite")
+
+
+def antithetical_pair_id(candidate_id: Array, population_size: int) -> Array:
+    """Map a candidate id to its shared antithetical pair index in ``[0, N/2)``."""
+    half = population_size // 2
+    return jnp.asarray(candidate_id, dtype=jnp.int32) % half
+
+
+def antithetical_sign(candidate_id: Array, population_size: int) -> Array:
+    """``+1`` for the first half of the population, ``-1`` for the antithetical half."""
+    half = population_size // 2
+    return jnp.where(jnp.asarray(candidate_id, dtype=jnp.int32) < half, jnp.int32(1), jnp.int32(-1))
+
+
+def shape_antithetical_loss(losses: Array) -> Array:
+    """Per-pair weights ``sign(L_- - L_+)`` in ``{-1, 0, 1}`` (Eggroll Appendix H.2).
+
+    Population must be even. Index ``i`` (``0..N/2-1``) is the ``+`` perturbation;
+    ``i + N/2`` is the antithetical ``-`` perturbation. Positive weight means the
+    ``+`` direction had lower loss and should be reinforced.
+    """
+    if losses.ndim != 1:
+        raise ValueError(f"losses must be one-dimensional, got shape {losses.shape}")
+    n = int(losses.shape[0])
+    if n < 2 or n % 2 != 0:
+        raise ValueError(f"antithetical shaping requires even population_size >= 2, got {n}")
+    half = n // 2
+    loss_pos = losses[:half]
+    loss_neg = losses[half:]
+    # Lower loss on + side → reinforce + factors.
+    return jnp.sign(loss_neg - loss_pos).astype(jnp.int32)

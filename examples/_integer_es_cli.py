@@ -1,8 +1,7 @@
 """Shared argparse / validation bits for the integer-ES (``integer_es=True``,
-±1 bin update) example scripts — currently ``train_cnn_int8_mlp.py`` and
-``train_int_rnn_minipile.py``.
+±1 bin update) example scripts — currently ``train_cnn_int8_mlp.py``.
 
-Both scripts tune the same handful of ``ZeroGrad`` knobs (population parity,
+Integer-ES scripts tune the same handful of ``ZeroGrad`` knobs (population parity,
 the vmap-vs-chunked candidate map, and the ±1 bin update fraction) with
 identical semantics but script-specific defaults/help text elsewhere, so only
 the genuinely duplicated pieces are factored out here — not a full shared

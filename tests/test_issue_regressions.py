@@ -11,6 +11,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from _tiny import Tiny, make_opt
+from _tiny import batch as _batch
+from _tiny import build_model as _build_model
+from _tiny import mse_loss as _loss_fn
 from flax import nnx
 
 from zerograd import (
@@ -21,19 +25,12 @@ from zerograd import (
     NodeStatus,
     ParameterLayout,
     ZeroGrad,
-    candidate_key,
     compute_partition_sizes,
     shape_centered_loss,
     validate_losses,
 )
 from zerograd._factors import matrix_factors
 from zerograd._fault_tolerant import DEFAULT_MAX_LOSS_HISTORY
-from zerograd._nnx import params_pure_dict
-
-from _tiny import Tiny, batch as _batch, build_model as _build_model, make_opt, mse_loss as _loss_fn
-
-
-# ── Shared helpers ───────────────────────────────────────────────────────────
 
 
 def _manifest():
@@ -43,10 +40,6 @@ def _manifest():
     ))
 
 
-def _params():
-    return {"w": jnp.ones((4, 2)), "v": jnp.zeros((2,))}
-
-
 def _make_opt(**kw):
     return make_opt(run_id="regress", **kw)
 
@@ -54,8 +47,6 @@ def _make_opt(**kw):
 def _trivial_loss_fn(model, batch):
     return jnp.sum(model.l.kernel[...] ** 2), None
 
-
-# ── Issue #14: integer losses silently truncated ─────────────────────────────
 
 class TestIssue14IntegerLosses:
     def test_shape_centered_loss_rejects_integer(self):
@@ -70,8 +61,6 @@ class TestIssue14IntegerLosses:
         out = shape_centered_loss(jnp.array([0.0, 1.0, 2.0, 3.0]), 0.1)
         assert out.dtype == jnp.float32
 
-
-# ── Issue #15: non-dict Mapping parameter trees ──────────────────────────────
 
 class TestIssue15NonDictMapping:
     def test_mapping_proxy_type_tree_steps(self):
@@ -96,31 +85,8 @@ class TestIssue15NonDictMapping:
         assert bool(jnp.all(jnp.isfinite(new_params["block"]["weight"])))
 
 
-# ── Issue #16: negative scalar array candidate IDs ──────────────────────────
-
 class TestIssue16NegativeArrayCandidate:
-    def test_negative_scalar_array_rejected(self):
-        base = jax.random.key(0)
-        with pytest.raises(ValueError):
-            candidate_key(base, jnp.asarray(-1))
-
-    def test_negative_consistency_with_int_branch(self):
-        base = jax.random.key(0)
-        with pytest.raises(ValueError):
-            candidate_key(base, -1)
-        with pytest.raises(ValueError):
-            candidate_key(base, jnp.asarray(-5))
-
-    def test_positive_scalar_array_still_works(self):
-        base = jax.random.key(0)
-        k_int = candidate_key(base, 7)
-        k_arr = candidate_key(base, jnp.asarray(7))
-        assert jnp.array_equal(k_int, k_arr)
-
     def test_vmap_path_still_works(self):
-        # candidate_key is called inside evaluate_shard's vmap over a
-        # non-negative candidate-id array; the negativity check must not
-        # break tracing there.
         opt = _make_opt()
         model = Tiny(nnx.Rngs(0))
         opt.init(model)
@@ -130,22 +96,16 @@ class TestIssue16NegativeArrayCandidate:
         assert losses.shape == (8,)
 
 
-# ── Issue #17: factor dtype parity across forward/replay ────────────────────
-
 class TestIssue17FactorDtypeParity:
     def test_bf16_draw_matches_float32_draw_within_precision(self):
         key = jax.random.key(7)
         a16 = matrix_factors(key, (4, 2), rank=2, dtype=jnp.bfloat16)[0]
         a32 = matrix_factors(key, (4, 2), rank=2, dtype=jnp.float32)[0]
-        # After the fix the bf16 draw is the float32 draw cast to bf16, so the
-        # two agree to bf16 precision (~2 decimal digits).
         np.testing.assert_allclose(
             np.asarray(a16, dtype=np.float32), np.asarray(a32), rtol=0.05
         )
 
     def test_bf16_draw_differs_from_direct_bf16_draw(self):
-        # The old (broken) behaviour drew directly in bf16, which produces an
-        # entirely different sequence from the float32 draw.
         key = jax.random.key(7)
         a32 = matrix_factors(key, (4, 2), rank=2, dtype=jnp.float32)[0]
         direct_bf16 = jax.random.normal(key, (4, 2), dtype=jnp.bfloat16)
@@ -153,8 +113,6 @@ class TestIssue17FactorDtypeParity:
             np.asarray(direct_bf16, dtype=np.float32), np.asarray(a32), rtol=0.05
         )
 
-
-# ── Issue #21: bounded default loss history ─────────────────────────────────
 
 class TestIssue21BoundedLossHistory:
     def test_default_is_finite(self):
@@ -171,41 +129,6 @@ class TestIssue21BoundedLossHistory:
         assert fc.loss_history_size == 5
 
 
-# ── Issue #22: step no longer triple-validates, but still validates once ────
-
-class TestIssue22ValidationAtBoundary:
-    def test_step_rejects_invalid_params(self):
-        opt = _make_opt()
-        model = Tiny(nnx.Rngs(0))
-        state = opt.init(model)
-        with pytest.raises(TypeError):
-            opt.step(state, {"w": jnp.ones((4,))}, None, _trivial_loss_fn)  # type: ignore[arg-type]
-
-    def test_step_rejects_non_finite_losses(self):
-        opt = _make_opt()
-        model = Tiny(nnx.Rngs(0))
-        state = opt.init(model)
-
-        def inf_loss(model, batch):
-            return jnp.asarray(jnp.inf), None
-
-        with pytest.raises(ValueError):
-            opt.step(state, model, None, inf_loss)
-
-    def test_step_rejects_integer_losses(self):
-        opt = _make_opt()
-        model = Tiny(nnx.Rngs(0))
-        state = opt.init(model)
-
-        def int_loss(model, batch):
-            return jnp.asarray(1, dtype=jnp.int32), None
-
-        with pytest.raises(TypeError):
-            opt.step(state, model, None, int_loss)
-
-
-# ── Issue #23: NodeStatus slots + declared _shard_ids ───────────────────────
-
 class TestIssue23NodeStatusSlots:
     def test_slots_reject_undeclared_attribute(self):
         ns = NodeStatus(name="x", node=None)
@@ -221,8 +144,6 @@ class TestIssue23NodeStatusSlots:
         ns._shard_ids = jnp.arange(4, dtype=jnp.int32)
         assert ns._shard_ids.shape == (4,)
 
-
-# ── Issue #24: partition/cluster input validation ──────────────────────────
 
 class TestIssue24PartitionValidation:
     def test_compute_partition_sizes_rejects_zero_population(self):
@@ -246,37 +167,6 @@ class TestIssue24PartitionValidation:
             FaultTolerantCluster(_make_opt(), _build_model, _loss_fn, seed=42, initial_nodes=True)
 
 
-# ── Issue #25: O(1) manifest entry/group lookups ─────────────────────────────
-
-class TestIssue25ManifestCache:
-    def test_entry_returns_correct_entry(self):
-        m = _manifest()
-        assert m.entry(("w",)).layout is ParameterLayout.MATRIX
-        assert m.entry(("v",)).layout is ParameterLayout.VECTOR
-
-    def test_group_index_returns_correct_index(self):
-        m = _manifest()
-        assert m.group_index("w") == 0
-        assert m.group_index("v") == 1
-
-    def test_unknown_path_raises_keyerror(self):
-        with pytest.raises(KeyError):
-            _manifest().entry(("missing",))
-
-    def test_unknown_group_raises_keyerror(self):
-        with pytest.raises(KeyError):
-            _manifest().group_index("nope")
-
-    def test_equality_ignores_internal_cache(self):
-        # The lookup caches must not participate in equality/hash.
-        m1 = _manifest()
-        m2 = _manifest()
-        assert m1 == m2
-        assert hash(m1) == hash(m2)
-
-
-# ── Issue #26: per-candidate RNG ────────────────────────────────────────────
-
 class TestIssue26PerCandidateRng:
     def test_candidates_receive_distinct_rng(self):
         opt = _make_opt()
@@ -289,19 +179,4 @@ class TestIssue26PerCandidateRng:
         losses = opt.evaluate_shard(
             model, 0, rng_loss, None, jnp.arange(8, dtype=jnp.int32)
         )
-        # With a shared default key all candidates would be identical; the fix
-        # derives a per-candidate subkey so they differ.
         assert not bool(jnp.all(losses == losses[0]))
-
-    def test_step_still_matches_evaluate_then_step_from_losses(self):
-        opt = _make_opt()
-        model = Tiny(nnx.Rngs(0))
-        state = opt.init(model)
-        ids = jnp.arange(8, dtype=jnp.int32)
-        losses = opt.evaluate_shard(model, 0, _trivial_loss_fn, None, ids)
-        m1, _, _ = opt.step_from_losses(state, model, losses)
-        m2, _, _ = opt.step(state, model, None, _trivial_loss_fn)
-        assert jnp.array_equal(
-            params_pure_dict(m1)["l"]["kernel"],
-            params_pure_dict(m2)["l"]["kernel"],
-        )

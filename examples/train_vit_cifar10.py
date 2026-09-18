@@ -27,13 +27,12 @@ import time
 import jax
 import jax.numpy as jnp
 import optax
+from _checkpoint import save_checkpoint
+from _data import load_cifar10
 from flax import nnx
 
 from zerograd import ZeroGrad, mark_table
 from zerograd._nnx import params_pure_dict
-
-from _checkpoint import save_checkpoint
-from _data import load_cifar10
 
 # ── ViT config ────────────────────────────────────────────────────────────────
 PATCH_SIZE = 4

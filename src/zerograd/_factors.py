@@ -9,10 +9,18 @@ from numbers import Real
 import jax
 import jax.numpy as jnp
 
-from ._eggroll_h import int8_from_normal
 from ._integer import factor_compute_dtype
 
 Array = jax.Array
+
+# Factors are round(16 * N(0,1)) clipped to int8 (Eggroll Appendix H.1 / G.3).
+INT8_FACTOR_SCALE = 16
+
+
+def int8_from_normal(key: Array, shape: tuple[int, ...]) -> Array:
+    """Sample int8 perturbation factors: ``round(16 * N(0,1))`` clipped to ``[-128, 127]``."""
+    raw = jax.random.normal(key, shape, dtype=jnp.float32) * float(INT8_FACTOR_SCALE)
+    return jnp.clip(jnp.rint(raw), -128, 127).astype(jnp.int8)
 
 
 def _validate_rank(rank: int) -> None:
@@ -211,7 +219,11 @@ def int_table_factors_for_rows(
     rank: int,
     row_ids: Array,
 ) -> tuple[Array, Array]:
-    """``A[row_ids]`` via bulk ``int_table_factors`` then gather (exact match)."""
+    """Gather ``(A[row_ids], B)`` from a full :func:`int_table_factors` draw.
+
+    Matches indexing used by :func:`~zerograd._candidate.perturbed_int_table_lookup`
+    so sparse row subsets stay consistent with the bulk table factors.
+    """
     a, b = int_table_factors(key, shape, rank)
     return a[jnp.asarray(row_ids, dtype=jnp.int32)], b
 

@@ -1,0 +1,125 @@
+"""Seed-derived cluster ZeroGrad: params never communicated.
+
+Demonstrates the core scaling property: each node computes its own
+parameters from a shared seed and the sequence of fitness arrays.
+Only the 1D loss array is shared between nodes — no params, gradients,
+or optimizer state ever cross node boundaries.
+
+This script runs N nodes in-process (simulating a multi-node cluster)
+and verifies after every step that all nodes have identical params.
+It also verifies the cluster matches a single-node baseline.
+
+    uv run python examples/train_cluster_seed_derived.py [--steps N] [--nodes N]
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+import jax
+import jax.numpy as jnp
+import optax
+from _xor_model import XOR_X, XOR_Y, accuracy, build_model, loss_fn
+
+from zerograd import ClusterZeroGrad, ZeroGrad
+from zerograd._nnx import params_pure_dict
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Seed-derived cluster ZeroGrad")
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--nodes", type=int, default=4)
+    parser.add_argument("--pop", type=int, default=32)
+    parser.add_argument("--rank", type=int, default=4)
+    parser.add_argument("--sigma", type=float, default=0.15)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    optimizer = ZeroGrad(
+        optax.adamw(learning_rate=args.lr, weight_decay=0.0),
+        population_size=args.pop,
+        rank=args.rank,
+        sigma=args.sigma,
+        seed=args.seed,
+        run_id="cluster-xor",
+    )
+
+    cluster = ClusterZeroGrad(
+        optimizer,
+        build_model,
+        loss_fn,
+        seed=args.seed,
+        num_nodes=args.nodes,
+    )
+
+    batch = (XOR_X, XOR_Y)
+
+    print("Seed-derived cluster ZeroGrad")
+    print(f"  Nodes: {args.nodes} (each independently computes params from seed={args.seed})")
+    print(f"  Population: {args.pop} ({cluster.partition_sizes} per node)")
+    print("  Communication per step:")
+    print(f"    Losses: {cluster.losses_bytes_per_step} bytes (shared)")
+    print(f"    Params: {cluster.params_bytes} bytes (NOT shared — computed locally)")
+    print(f"    Savings: {cluster.params_bytes / cluster.losses_bytes_per_step:.0f}x per step")
+    if args.steps > 0:
+        total_losses = cluster.losses_bytes_per_step * args.steps
+        total_params_would = cluster.params_bytes * args.steps * args.nodes
+        print(f"    Over {args.steps} steps: {total_losses:,} bytes losses vs "
+              f"{total_params_would:,} bytes params would-be")
+    print(f"  Steps: {args.steps}\n")
+
+    # ── Baseline: single-node ──────────────────────────────────────────────────
+    print("Running single-node baseline...")
+    opt_single = ZeroGrad(
+        optax.adamw(learning_rate=args.lr, weight_decay=0.0),
+        population_size=args.pop,
+        rank=args.rank,
+        sigma=args.sigma,
+        seed=args.seed,
+        run_id="cluster-xor",
+    )
+    model_single = build_model(jax.random.key(args.seed))
+    state_single = opt_single.init(model_single)
+    for step in range(args.steps):
+        model_single, state_single, _ = opt_single.step(
+            state_single, model_single, batch, loss_fn)
+    baseline_loss = float(jnp.mean((model_single(XOR_X) - XOR_Y) ** 2))
+    print(f"  Baseline final loss: {baseline_loss:.4f}\n")
+
+    # ── Cluster ─────────────────────────────────────────────────────────────────
+    print("Running cluster...")
+    t0 = time.time()
+    for step in range(args.steps):
+        model, state, metrics = cluster.step(batch)
+        synced = cluster.verify_sync()
+
+        if step % 50 == 0 or step == args.steps - 1:
+            acc = accuracy(model)
+            print(f"  gen {metrics.generation:3d}  loss={metrics.mean_loss:.4f}  "
+                  f"acc={acc:.0%}  sync={'✓' if synced else '✗'}  "
+                  f"({(time.time() - t0) / (step + 1):.3f}s/step)")
+
+    # ── Verification ────────────────────────────────────────────────────────────
+    final_synced = cluster.verify_sync()
+    acc = accuracy(model)
+
+    cluster_leaves = jax.tree_util.tree_leaves(params_pure_dict(model))
+    single_leaves = jax.tree_util.tree_leaves(params_pure_dict(model_single))
+    max_diff = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(cluster_leaves, single_leaves, strict=True))
+
+    print(f"\n{'=' * 60}")
+    print("VERIFICATION")
+    print(f"{'=' * 60}")
+    print(f"  All nodes have identical params:  {'✓' if final_synced else '✗'}")
+    print(f"  Cluster matches single-node:      {'✓' if max_diff < 1e-5 else '✗'}  (diff={max_diff:.2e})")
+    print(f"  Final accuracy:                   {acc:.0%}")
+    print(f"  Total time:                       {time.time() - t0:.1f}s")
+    print(f"\n  Per-step communication: {cluster.losses_bytes_per_step} bytes (losses only)")
+    print("  Params never communicated: 0 bytes")
+    print("  Each node computed params locally from seed + loss history")
+
+
+if __name__ == "__main__":
+    main()

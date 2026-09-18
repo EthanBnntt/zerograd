@@ -3,8 +3,11 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from _tiny import batch as _batch
+from _tiny import build_model as _build_model
+from _tiny import make_opt
+from _tiny import mse_loss as _loss_fn
 
-from _tiny import batch as _batch, build_model as _build_model, make_opt, mse_loss as _loss_fn
 from zerograd import (
     ClusterZeroGrad,
     ZeroGradNode,
@@ -102,7 +105,7 @@ class TestClusterConstruction:
         )
         leaves0 = jax.tree_util.tree_leaves(cluster.nodes[0].params)
         for node in cluster.nodes[1:]:
-            for a, b in zip(leaves0, jax.tree_util.tree_leaves(node.params)):
+            for a, b in zip(leaves0, jax.tree_util.tree_leaves(node.params), strict=True):
                 assert jnp.array_equal(a, b)
         # verify_sync trivially true at generation 0
         assert cluster.verify_sync()
@@ -132,7 +135,7 @@ class TestClusterStep:
         cluster = ClusterZeroGrad(
             _make_opt(pop=8), _build_model, _loss_fn, seed=42, num_nodes=3,
         )
-        params, state, metrics = cluster.step(_batch())
+        _params, state, metrics = cluster.step(_batch())
         assert state.generation == 1
         assert metrics.population_size == 8
         assert cluster.verify_sync(), "all nodes must converge to identical params"
@@ -149,7 +152,7 @@ class TestClusterStep:
         assert cstate.generation == 1
         # Single-node cluster: verify_sync short-circuits to True.
         assert cluster.verify_sync()
-        for a, b in zip(jax.tree_util.tree_leaves(cparams), jax.tree_util.tree_leaves(ref_params)):
+        for a, b in zip(jax.tree_util.tree_leaves(cparams), jax.tree_util.tree_leaves(ref_params), strict=True):
             assert jnp.allclose(a, b)
 
     def test_multi_node_matches_single_node_baseline(self):
@@ -165,9 +168,9 @@ class TestClusterStep:
         # Cluster with 4 nodes must match after the same number of steps.
         cluster = ClusterZeroGrad(opt, _build_model, _loss_fn, seed=42, num_nodes=4)
         for _ in range(3):
-            cparams, cstate, _ = cluster.step(batch)
+            cparams, _cstate, _ = cluster.step(batch)
         assert cluster.verify_sync()
-        for a, b in zip(jax.tree_util.tree_leaves(cparams), jax.tree_util.tree_leaves(params)):
+        for a, b in zip(jax.tree_util.tree_leaves(cparams), jax.tree_util.tree_leaves(params), strict=True):
             assert jnp.allclose(a, b, atol=1e-5)
 
     def test_weighted_cluster_still_syncs(self):

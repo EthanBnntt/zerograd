@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
 # ── Model: 2→16→1 MLP on XOR ─────────────────────────────────────────────────

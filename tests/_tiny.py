@@ -37,14 +37,14 @@ def mse_loss(model, batch):
 
 
 def make_opt(pop: int = 8, **kw) -> ZeroGrad:
-    defaults = dict(
-        transform=optax.adamw(0.01),
-        population_size=pop,
-        rank=2,
-        sigma=0.1,
-        seed=42,
-        run_id="test",
-    )
+    defaults = {
+        "transform": optax.adamw(0.01),
+        "population_size": pop,
+        "rank": 2,
+        "sigma": 0.1,
+        "seed": 42,
+        "run_id": "test",
+    }
     defaults.update(kw)
     # Support legacy manifest= kw by ignoring it (NNX auto-manifest).
     defaults.pop("manifest", None)
