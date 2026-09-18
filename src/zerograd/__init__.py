@@ -72,6 +72,13 @@ from ._nnx import (
     mark_ternary,
 )
 from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
+from ._snn import (
+    Leaky,
+    Spiking,
+    encode_poisson,
+    encode_rate,
+    spike_count_logits,
+)
 
 __all__ = [
     "CalibrationResult",
@@ -97,6 +104,8 @@ __all__ = [
     "StepMetrics",
     "TernaryLinear",
     "TernaryLinearLUT",
+    "Leaky",
+    "Spiking",
     "ZeroGrad",
     "ZeroGradNode",
     "ZeroGradSlot",
@@ -120,6 +129,8 @@ __all__ = [
     "collect_int_bits_by_path",
     "compute_partition_sizes",
     "egg_clip_cast",
+    "encode_poisson",
+    "encode_rate",
     "egg_init_matrix",
     "egg_requantize",
     "float_to_egg_i8",
@@ -137,6 +148,7 @@ __all__ = [
     "pack_ternary",
     "packed_ternary_lut_fused",
     "shape_antithetical_loss",
+    "spike_count_logits",
     "shape_centered_loss",
     "step_key",
     "ternary_lut_reference",
