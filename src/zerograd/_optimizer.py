@@ -533,6 +533,58 @@ class ZeroGrad:
                 f"losses must have {self._population_size} entries, got {losses.shape[0]}"
             )
 
+    def _jit_float_step(self, params: ParameterTree):
+        """Compile loss-shaping + factor replay + pseudo-grad + Optax update as
+        one device program (float ES path).
+
+        Same rationale as :meth:`_jit_integer_bin_step`: the eager path
+        dispatched one program per manifest leaf for replay and ran the Optax
+        transform piecemeal, so Python dispatch dominated generation loops on
+        small models.
+        """
+        if not hasattr(self, "_float_step_jit_cache"):
+            self._float_step_jit_cache: dict = {}
+        sig = _tree_sig(params)
+        jit_fn = self._float_step_jit_cache.get(sig)
+        if jit_fn is None:
+            assert self._manifest is not None
+            manifest = self._manifest
+            rank = self._rank
+            sigma = self._sigma
+            pop = self._population_size
+            candidate_ids = jnp.arange(pop, dtype=jnp.int32)
+            even = pop % 2 == 0
+
+            def replay_and_update(params_p, losses_p, base_key_p, opt_state_p):
+                shaped = shape_centered_loss(losses_p, sigma)
+                descent = replay(
+                    params_p, manifest, base_key_p, candidate_ids, shaped, rank
+                )
+                pseudo_grad = _build_pseudo_grad(descent, params_p)
+                float_params = float_view_tree(params_p)
+                updates, new_opt_state = self._transform.update(
+                    pseudo_grad, opt_state_p, float_params
+                )
+                new_float = cast(Any, optax.apply_updates(float_params, updates))
+                new_params = snap_tree_to_integer(new_float, params_p)
+                if even:
+                    half = pop // 2
+                    margin = jnp.mean(jnp.abs(losses_p[:half] - losses_p[half:]))
+                else:
+                    margin = jnp.asarray(jnp.nan, dtype=losses_p.dtype)
+                metrics = (
+                    jnp.mean(losses_p),
+                    jnp.min(losses_p),
+                    jnp.max(losses_p),
+                    jnp.std(losses_p),
+                    margin,
+                )
+                return new_params, new_opt_state, metrics
+
+            jit_fn = jax.jit(replay_and_update)
+            self._float_step_jit_cache[sig] = jit_fn
+        return jit_fn
+
     def _optax_from_descent(
         self,
         params: ParameterTree,
@@ -627,12 +679,16 @@ class ZeroGrad:
                 params, descent, state.opt_state, bits=self._int_bits
             )
         else:
-            candidate_ids = jnp.arange(self._population_size, dtype=jnp.int32)
-            shaped = shape_centered_loss(losses, self._sigma)
-            descent = replay(params, self._manifest, base_key, candidate_ids, shaped, self._rank)
-            new_params, new_opt_state = self._optax_from_descent(
-                params, descent, state.opt_state, bits=None
+            update_fn = self._jit_float_step(params)
+            new_params, new_opt_state, m = update_fn(params, losses, base_key, state.opt_state)
+            new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
+            metrics = StepMetrics(
+                generation=generation,
+                mean_loss=m[0], min_loss=m[1], max_loss=m[2], std_loss=m[3],
+                mean_pair_margin=m[4],
+                population_size=self._population_size,
             )
+            return new_params, new_state, metrics
 
         new_state = ZeroGradState(generation=generation + 1, opt_state=new_opt_state)
         if self._population_size % 2 == 0:
