@@ -40,6 +40,37 @@ def egg_matmul_divisor(in_features: int) -> int:
     return max(1, round(16.0 * math.sqrt(float(in_features))))
 
 
+def ternary_matmul_divisor(in_features: int) -> int:
+    """Ternary-weight GEMM requantize divisor ``≈ √K``, integer ≥ 1.
+
+    EGG's :func:`egg_matmul_divisor` (``16√K``) is calibrated for int8 weights
+    of magnitude ~16 (``round(16·N)``). Ternary weights are unit-magnitude, so
+    the same divisor shrinks activations ~16× per layer and stacked ternary
+    layers collapse to zero. Dividing by ``√K`` preserves the activation scale
+    (up to the ternary weight std ≈ 0.83), so deep ternary MLPs keep signal.
+    """
+    if in_features < 1:
+        raise ValueError(f"in_features must be positive, got {in_features}")
+    return max(1, round(math.sqrt(float(in_features))))
+
+
+def ternary_requantize(
+    y: Array,
+    in_features: int,
+    *,
+    act_dtype: jnp.dtype = jnp.int8,
+) -> Array:
+    """Scale a ternary GEMM int32 accumulator by ``√K`` then clip-cast.
+
+    Ternary analogue of :func:`egg_requantize`. When ``act_dtype`` is int32
+    (e.g. logits), skip the narrow clip so the loss sees a usable range.
+    """
+    scaled = y.astype(jnp.int32) // ternary_matmul_divisor(in_features)
+    if act_dtype == jnp.int32:
+        return scaled
+    return egg_clip_cast(scaled)
+
+
 def egg_requantize(
     y: Array,
     in_features: int,
@@ -144,6 +175,64 @@ def ternary_dequant_scale(gamma: Array, eta: Array) -> Array:
     return (
         gamma.astype(jnp.float32) * eta.astype(jnp.float32) / float(ABSMAX_INT8)
     )
+
+
+#: Ternary values per packed byte (2 bits each, codes {0,1,2} = value + 1).
+TERNARY_PER_BYTE = 4
+
+
+def pack_ternary(w: Array) -> Array:
+    """Pack an int8 ternary kernel ``{-1,0,1}`` ``(K, N)`` → ``uint8`` ``(K//4, N)``.
+
+    Each output byte holds 4 consecutive ``K``-axis weights for one column,
+    2 bits apiece: ``code = value + 1 ∈ {0,1,2}`` stored little-endian within
+    the byte (``byte = c0 | c1<<2 | c2<<4 | c3<<6``). Packing along the
+    contraction axis lets a fused kernel load 4 weights per byte (4× weight
+    bandwidth) and unpack on the fly.
+
+    ``w`` must be int8 with values in ``{-1, 0, 1}`` (a documented
+    precondition; dtype/shape are validated eagerly, values are not — this
+    runs under ``jit``). ``K`` must be divisible by :data:`TERNARY_PER_BYTE`.
+    """
+    if not isinstance(w, jax.Array) or w.dtype != jnp.int8:
+        raise TypeError(f"pack_ternary expects an int8 array, got {getattr(w, 'dtype', type(w))}")
+    if w.ndim != 2:
+        raise ValueError(f"pack_ternary expects a 2-D (K, N) kernel, got shape {w.shape}")
+    k, n = (int(w.shape[0]), int(w.shape[1]))
+    if k % TERNARY_PER_BYTE != 0:
+        raise ValueError(
+            f"pack_ternary requires K divisible by {TERNARY_PER_BYTE}, got K={k}"
+        )
+    codes = (w.astype(jnp.int32) + 1).reshape(k // TERNARY_PER_BYTE, TERNARY_PER_BYTE, n)
+    packed = (
+        codes[:, 0, :]
+        | (codes[:, 1, :] << 2)
+        | (codes[:, 2, :] << 4)
+        | (codes[:, 3, :] << 6)
+    )
+    return packed.astype(jnp.uint8)
+
+
+def unpack_ternary(packed: Array, *, out_dtype: jnp.dtype = jnp.int8) -> Array:
+    """Inverse of :func:`pack_ternary`: ``uint8`` ``(K//4, N)`` → int8 ``(K, N)``.
+
+    Bit-identical round-trip for any input produced by :func:`pack_ternary`.
+    """
+    if not isinstance(packed, jax.Array) or packed.dtype != jnp.uint8:
+        raise TypeError(
+            f"unpack_ternary expects a uint8 array, got {getattr(packed, 'dtype', type(packed))}"
+        )
+    if packed.ndim != 2:
+        raise ValueError(
+            f"unpack_ternary expects a 2-D (K//4, N) packed array, got shape {packed.shape}"
+        )
+    q, n = (int(packed.shape[0]), int(packed.shape[1]))
+    b = packed.astype(jnp.int32)
+    codes = jnp.stack(
+        [b & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3], axis=1
+    )
+    w = (codes - 1).reshape(q * TERNARY_PER_BYTE, n)
+    return w.astype(out_dtype)
 
 
 def rms_norm(x: Array, scale: Array, *, eps: float = 1e-6) -> Array:

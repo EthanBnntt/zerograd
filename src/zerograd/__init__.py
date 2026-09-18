@@ -18,6 +18,11 @@ from ._distributed import (
 from ._fault_tolerant import FaultTolerantCluster, NodeStatus
 from ._fitness import shape_antithetical_loss, shape_centered_loss, validate_losses
 from ._fused_lut import fused_linear_lut, int_linear_lut_fused
+from ._fused_ternary import (
+    fused_ternary_lut,
+    packed_ternary_lut_fused,
+    ternary_lut_reference,
+)
 from ._integer import (
     egg_clip_cast,
     egg_init_matrix,
@@ -28,6 +33,8 @@ from ._integer import (
     int_conv2d,
     int_conv2d_flat,
     int_matmul,
+    pack_ternary,
+    unpack_ternary,
 )
 from ._keys import candidate_key, group_key, step_key
 from ._manifest import (
@@ -45,6 +52,7 @@ from ._nnx import (
     IntLinearLUT,
     IntLUT,
     TernaryLinear,
+    TernaryLinearLUT,
     ZeroGradSlot,
     ZgConv,
     ZgEmbed,
@@ -55,10 +63,13 @@ from ._nnx import (
     ZgLayerNorm,
     ZgLinear,
     ZgTable,
+    ZgTernaryIntLinear,
     ZgTernaryLinear,
     ZgVector,
     apply_surgery,
+    collect_int_bits_by_path,
     mark_table,
+    mark_ternary,
 )
 from ._optimizer import ModelLossFn, StepMetrics, ZeroGrad, ZeroGradState
 
@@ -85,6 +96,7 @@ __all__ = [
     "ShardResult",
     "StepMetrics",
     "TernaryLinear",
+    "TernaryLinearLUT",
     "ZeroGrad",
     "ZeroGradNode",
     "ZeroGradSlot",
@@ -105,6 +117,7 @@ __all__ = [
     "apply_surgery",
     "bin_update_threshold",
     "candidate_key",
+    "collect_int_bits_by_path",
     "compute_partition_sizes",
     "egg_clip_cast",
     "egg_init_matrix",
@@ -112,6 +125,7 @@ __all__ = [
     "float_to_egg_i8",
     "float_to_int",
     "fused_linear_lut",
+    "fused_ternary_lut",
     "group_key",
     "int_avg_pool2d",
     "int_conv2d",
@@ -119,9 +133,14 @@ __all__ = [
     "int_linear_lut_fused",
     "int_matmul",
     "mark_table",
+    "mark_ternary",
+    "pack_ternary",
+    "packed_ternary_lut_fused",
     "shape_antithetical_loss",
     "shape_centered_loss",
     "step_key",
+    "ternary_lut_reference",
     "threshold_tree_for_manifest",
+    "unpack_ternary",
     "validate_losses",
 ]

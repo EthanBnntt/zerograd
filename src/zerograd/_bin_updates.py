@@ -115,40 +115,41 @@ def apply_bin_updates(
     evidence: Array | ParameterTree,
     threshold: int | Array | ThresholdTree,
     *,
-    qmin: int | None = None,
-    qmax: int | None = None,
+    qmin: int | ThresholdTree | None = None,
+    qmax: int | ThresholdTree | None = None,
 ) -> Array | ParameterTree:
     """Move each integer leaf by one discrete bin when ``|E| > threshold``.
 
     ``threshold`` may be a scalar (same bar for every leaf) or a pytree matching
     ``params`` (from :func:`threshold_tree_for_manifest`).
 
-    Optional ``qmin``/``qmax`` override the dtype iinfo range (e.g. int4 in int8 storage).
+    Optional ``qmin``/``qmax`` override the dtype iinfo range (e.g. int4 in int8
+    storage, or ternary ``{-1,0,1}``). Each may be a scalar (same range for every
+    leaf) or a pytree matching ``params`` for per-leaf ranges (mixed models with
+    int8 and ternary leaves side by side).
     """
     if isinstance(params, dict) and isinstance(evidence, dict):
         out: dict = {}
-        if isinstance(threshold, dict):
-            for k, v in params.items():
-                e = evidence.get(k)
-                if e is None:
-                    out[k] = v
-                else:
-                    out[k] = apply_bin_updates(v, e, threshold[k], qmin=qmin, qmax=qmax)
-        else:
-            for k, v in params.items():
-                e = evidence.get(k)
-                if e is None:
-                    out[k] = v
-                else:
-                    out[k] = apply_bin_updates(v, e, threshold, qmin=qmin, qmax=qmax)
+        for k, v in params.items():
+            e = evidence.get(k)
+            if e is None:
+                out[k] = v
+                continue
+            thr_k = threshold[k] if isinstance(threshold, dict) else threshold
+            qmin_k = qmin[k] if isinstance(qmin, dict) else qmin
+            qmax_k = qmax[k] if isinstance(qmax, dict) else qmax
+            out[k] = apply_bin_updates(v, e, thr_k, qmin=qmin_k, qmax=qmax_k)
         return out
     if isinstance(params, jax.Array) and isinstance(evidence, jax.Array):
         if not jnp.issubdtype(params.dtype, jnp.integer):
             return params
         if isinstance(threshold, dict):
             raise TypeError("threshold tree does not align with parameter arrays")
+        if isinstance(qmin, dict) or isinstance(qmax, dict):
+            raise TypeError("qmin/qmax tree does not align with parameter arrays")
         info = jnp.iinfo(params.dtype)
-        # Optional int4-in-int8 clip only applies to int8 leaves; wider ints keep iinfo.
+        # Optional int4/ternary-in-int8 clip only applies to int8 leaves; wider
+        # ints keep their dtype iinfo.
         if qmin is not None and qmax is not None and params.dtype == jnp.int8:
             lo, hi = int(qmin), int(qmax)
         else:

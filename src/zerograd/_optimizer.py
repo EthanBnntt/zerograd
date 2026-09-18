@@ -31,6 +31,7 @@ from ._manifest import Manifest, ParameterTree
 from ._nnx import (
     apply_surgery,
     bind_candidate,
+    collect_int_bits_by_path,
     disable_candidates,
     model_zg_slot,
     optional_model_zg_slot,
@@ -211,6 +212,9 @@ class ZeroGrad:
         self._int_bin_updates = bool(integer_es) and (
             self._ternary_bins or (bool(int_bin_updates) and not self._bin_updates)
         )
+        # Per-leaf integer bit-widths from mark_ternary / INT_BITS metadata
+        # (populated at init). Empty → every int leaf uses ``self._int_bits``.
+        self._int_bits_by_path: dict[tuple[str, ...], int] = {}
 
     def init(self, model_or_params: nnx.Module | ParameterTree) -> ZeroGradState:
         """Initialize optimizer state.
@@ -252,6 +256,16 @@ class ZeroGrad:
             assert self._manifest is not None
             params = params_pure_dict(model)
             self._manifest.validate(params)
+            self._int_bits_by_path = collect_int_bits_by_path(model)
+            # Mixed int8 + ternary model under a non-identity transform: enable
+            # the int-bin path so ternary leaves snap to {-1,0,1} (per-leaf
+            # ranges) while any float leaves go through the Optax transform.
+            if (
+                self._integer_es
+                and not self._bin_updates
+                and any(bits == 2 for bits in self._int_bits_by_path.values())
+            ):
+                self._int_bin_updates = True
             if self._bin_updates:
                 opt_state = None
             else:
@@ -429,6 +443,34 @@ class ZeroGrad:
             base_key,
         )
 
+    def _qbound_trees(self, params: ParameterTree):
+        """Per-leaf ``(qmin, qmax)`` for bin updates, honoring marked ternary leaves.
+
+        Returns scalars when no leaf carries ``zerograd_int_bits`` metadata
+        (the common single-range case); otherwise returns qmin/qmax pytrees
+        aligned with ``params`` so int8 leaves snap to ``[-128,127]`` while
+        ternary-marked leaves snap to ``{-1,0,1}``.
+        """
+        by_path = self._int_bits_by_path
+        default_bits = self._int_bits
+        if not by_path:
+            return qrange(default_bits)
+
+        def build(node: Any, path: tuple[str, ...]) -> Any:
+            # Returns a (qmin_subtree, qmax_subtree) pair to avoid treating the
+            # (lo, hi) tuple as a pytree node (jax.tree.map would split it).
+            if isinstance(node, dict):
+                qmin_d: dict = {}
+                qmax_d: dict = {}
+                for k, v in node.items():
+                    lo_sub, hi_sub = build(v, (*path, str(k)))
+                    qmin_d[k] = lo_sub
+                    qmax_d[k] = hi_sub
+                return qmin_d, qmax_d
+            return qrange(by_path.get(tuple(path), default_bits))
+
+        return build(params, ())
+
     def _jit_update_bin_params(self, params: ParameterTree):
         """JIT the bin-update path once per params shape (cached on the instance).
 
@@ -441,7 +483,7 @@ class ZeroGrad:
         sig = _tree_sig(params)
         jit_fn = self._bin_update_jit_cache.get(sig)
         if jit_fn is None:
-            qmin, qmax = qrange(self._int_bits)
+            qmin, qmax = self._qbound_trees(params)
 
             def _update(params_p, evidence_p, thresholds_p):
                 return apply_bin_updates(
@@ -475,7 +517,7 @@ class ZeroGrad:
             rank = self._rank
             half = self._population_size // 2
             pair_ids = jnp.arange(half, dtype=jnp.int32)
-            qmin, qmax = qrange(self._int_bits)
+            qmin, qmax = self._qbound_trees(params)
 
             def replay_and_update(params_p, losses_p, base_key_p, thresholds_p):
                 shaped_p = shape_antithetical_loss(losses_p)
